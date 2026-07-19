@@ -31,7 +31,7 @@ function Write-Info([string]$t) { Write-Host "  $t" -ForegroundColor Gray }
 
 # Bump when Diagnose behavior changes — must appear in console so we know
 # the client is not running a stale copy from an old PlayerConnect zip.
-$script:DiagnoseVersion = "2026-07-19d-schannel"
+$script:DiagnoseVersion = "2026-07-19e-nodeprobe"
 
 # C# AcceptAll is required on Windows PowerShell 5.1. Bare scriptblocks are
 # often NOT wired as RemoteCertificateValidationCallback, so SChannel rejects
@@ -324,7 +324,93 @@ if (-not $okGw) {
   Start-Sleep -Milliseconds 400
   $okGw = Test-GatewayTls -ProxyHost $hostName -ProxyPort $proxyPort -ProtocolLabel "TLS1.2 retry" -SslProtocol $tls12
 }
-# Optional second opinion via curl (often Schannel or LibreSSL with -k).
+# Node OpenSSL probe — distinguishes FRP/tunnel breaks from SChannel-only issues.
+if (-not $okGw) {
+  $node = Get-Command "node" -ErrorAction SilentlyContinue
+  if ($node) {
+    Write-Info "--- try Node.js CONNECT+TLS (OpenSSL, rejectUnauthorized=false) ---"
+    $nodeScript = @'
+const http = require("http");
+const tls = require("tls");
+const host = process.argv[1];
+const port = Number(process.argv[2]);
+const req = http.request({
+  host,
+  port,
+  method: "CONNECT",
+  path: "dev-public-gateway.evetech.net:443",
+  headers: { Host: "dev-public-gateway.evetech.net:443" },
+  timeout: 10000,
+});
+req.on("connect", (res, socket, head) => {
+  if (res.statusCode !== 200) {
+    console.error("CONNECT_STATUS " + res.statusCode);
+    process.exit(2);
+  }
+  if (head && head.length) {
+    try { socket.unshift(head); } catch (_) {}
+  }
+  const s = tls.connect(
+    {
+      socket,
+      servername: "dev-public-gateway.evetech.net",
+      rejectUnauthorized: false,
+      minVersion: "TLSv1.2",
+    },
+    () => {
+      console.log("OK " + (s.getProtocol() || "?") + " " + (s.alpnProtocol || "none"));
+      try {
+        const c = s.getPeerCertificate();
+        if (c && c.subject) console.log("SUBJECT " + JSON.stringify(c.subject));
+        if (c && c.issuer) console.log("ISSUER " + JSON.stringify(c.issuer));
+      } catch (_) {}
+      s.end();
+      process.exit(0);
+    },
+  );
+  s.setTimeout(10000, () => {
+    console.error("TLS_TIMEOUT");
+    s.destroy();
+    process.exit(3);
+  });
+  s.on("error", (e) => {
+    console.error("TLS_ERR " + e.message);
+    process.exit(4);
+  });
+});
+req.on("timeout", () => {
+  console.error("CONNECT_TIMEOUT");
+  req.destroy();
+  process.exit(5);
+});
+req.on("error", (e) => {
+  console.error("REQ_ERR " + e.message);
+  process.exit(6);
+});
+req.end();
+'@
+    $tmpJs = Join-Path $env:TEMP ("evejs-gw-tls-{0}.js" -f [guid]::NewGuid().ToString("n"))
+    try {
+      Set-Content -LiteralPath $tmpJs -Value $nodeScript -Encoding UTF8
+      $nodeOut = & node $tmpJs $hostName $proxyPort 2>&1
+      $nodeText = ($nodeOut | Out-String).Trim()
+      Write-Info $nodeText
+      if ($LASTEXITCODE -eq 0 -and $nodeText -match '^OK ') {
+        Write-Ok "Node OpenSSL gateway TLS OK (tunnel fine; Windows SChannel/curl may still fail on cert)"
+        $okGw = $true
+      } else {
+        Write-Bad "Node OpenSSL gateway TLS failed — tunnel/FRP/server TLS path is broken (not just SChannel)"
+      }
+    } catch {
+      Write-Bad ("Node probe error: {0}" -f $_.Exception.Message)
+    } finally {
+      try { Remove-Item -LiteralPath $tmpJs -Force -ErrorAction SilentlyContinue } catch {}
+    }
+  } else {
+    Write-Info "node not in PATH — skipped OpenSSL CONNECT probe"
+  }
+}
+# Optional curl second opinion.
 if (-not $okGw) {
   $curl = Get-Command "curl.exe" -ErrorAction SilentlyContinue
   if ($curl) {
@@ -342,7 +428,7 @@ if (-not $okGw) {
       $codeStr = "$code".Trim()
       Write-Info ("curl http_code={0}" -f $codeStr)
       if ($codeStr -match '^[23]\d\d$') {
-        Write-Ok "curl gateway via proxy succeeded (TLS path OK; SslStream may still be picky)"
+        Write-Ok "curl gateway via proxy succeeded"
         $okGw = $true
       } else {
         Write-Bad "curl gateway via proxy failed"
@@ -354,16 +440,13 @@ if (-not $okGw) {
 }
 if (-not $okGw) {
   Write-Info "CONNECT 200 + TLS reset often means:"
-  Write-Info "  1) Client Diagnose.ps1 is STALE. Console must show:"
-  Write-Info "       Script version: 2026-07-19d-schannel"
-  Write-Info "       --- try TLS1.2 + C# AcceptAll ---"
-  Write-Info "  2) Server log while step 5 runs must show:"
-  Write-Info "       PRX CONNECT ... -> LOCAL-MITM-HTTPS"
-  Write-Info "       [Proxy] CONNECT TLS-OK ...   (handshake completed)"
-  Write-Info "     BAD: tunnel closed ▲xxxB ▼yyyB (client-close) WITHOUT TLS-OK"
-  Write-Info "  3) Server startup should show:"
-  Write-Info "       full-path CONNECT+TLS self-test OK"
-  Write-Info "  4) Sync server.js + localTlsCertificate.js, full restart."
+  Write-Info "  1) Client Diagnose version must be: 2026-07-19e-nodeprobe"
+  Write-Info "  2) Server log during step 5 should show ONE of:"
+  Write-Info "       CONNECT ... -> LOCAL-WRAP-TLS   then  CONNECT TLS-OK ... (LOCAL-WRAP-TLS)"
+  Write-Info "       CONNECT ... -> LOCAL-MITM-HTTPS then  CONNECT TLS-OK ... (LOCAL-MITM-HTTPS)"
+  Write-Info "  3) If Node probe also fails: FRP must be type=tcp for 26002 (not http),"
+  Write-Info "     and server must run latest server.js (full restart)."
+  Write-Info "  4) Startup should log: full-path CONNECT+TLS self-test OK"
   Write-Info "  5) GET /health => localIntercept=true, connectMitmHttps=true"
   Write-Info "In-game paid UI also needs CA in client cacert.pem (Client launcher)."
 }
@@ -374,18 +457,17 @@ Write-Host @"
   On the SERVER window, while Diagnose runs step 5:
 
     GOOD (current code):
-      [Proxy] CONNECT MITM HTTPS ready on 127.0.0.1:... (HTTP/1.1, path=LOCAL-MITM-HTTPS)
-      PRX  CONNECT ... -> LOCAL-MITM-HTTPS 127.0.0.1:...
+      PRX  CONNECT ... -> LOCAL-WRAP-TLS
+      [Proxy] CONNECT TLS-OK ... (LOCAL-WRAP-TLS)
 
-    BAD (old in-process TLS wrap — ECONNRESET under FRP):
-      PRX  CONNECT ... -> LOCAL-INPROCESS-TLS
-      H2   inprocess TLSSocket error: read ECONNRESET
+    ALSO OK:
+      PRX  CONNECT ... -> LOCAL-MITM-HTTPS
+      [Proxy] CONNECT TLS-OK ... (LOCAL-MITM-HTTPS)
 
-    BAD (older loopback pipe only):
-      PRX  CONNECT ... -> LOCAL 127.0.0.1:26003
-
-    BAD intercept off:
-      PRX  CONNECT ... -> REMOTE dev-public-gateway.evetech.net:443
+    BAD:
+      tunnel closed ... WITHOUT CONNECT TLS-OK
+      CONNECT ... -> REMOTE dev-public-gateway.evetech.net:443
+      CONNECT ... -> LOCAL 127.0.0.1:26003
 
   Deploy the latest server.js into the folder that actually runs EveJS
   (e.g. C:\server\GorkServer\EveJS-v0.12.2-GUI), then fully restart.

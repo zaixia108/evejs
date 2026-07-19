@@ -1015,13 +1015,156 @@ function ensureConnectMitmHttpsServerAsync() {
 }
 
 /**
+ * Terminate TLS directly on the CONNECT socket (no second TCP hop).
+ * Handshake completion is enough for Diagnose; HTTP/1.1 is handed to the
+ * MITM https.Server request pipeline when the client sends application data.
+ */
+function attachConnectTlsWrap(clientSocket, head, label) {
+  const { tlsOptions } = loadLocalTlsOptions();
+
+  try {
+    clientSocket.pause();
+  } catch {
+    // ignore
+  }
+  try {
+    clientSocket.setTimeout(0);
+    clientSocket.setNoDelay(true);
+  } catch {
+    // ignore
+  }
+
+  const established =
+    "HTTP/1.1 200 Connection Established\r\n" +
+    "Proxy-Agent: EveJS Elysian\r\n" +
+    "\r\n";
+
+  clientSocket.write(established, (writeErr) => {
+    if (writeErr) {
+      log.proxyErr(`CONNECT 200 write failed ${label}: ${writeErr.message}`);
+      try {
+        clientSocket.destroy();
+      } catch {
+        // ignore
+      }
+      return;
+    }
+
+    try {
+      // Detach any leftover HTTP-parser listeners from the CONNECT upgrade.
+      for (const ev of ["data", "readable", "end", "timeout"]) {
+        clientSocket.removeAllListeners(ev);
+      }
+    } catch {
+      // ignore
+    }
+
+    const chunks = [];
+    if (head && head.length > 0) {
+      chunks.push(Buffer.isBuffer(head) ? head : Buffer.from(head));
+    }
+    try {
+      clientSocket.resume();
+      let buffered;
+      while ((buffered = clientSocket.read()) !== null) {
+        chunks.push(buffered);
+      }
+    } catch {
+      // ignore
+    }
+    try {
+      clientSocket.pause();
+    } catch {
+      // ignore
+    }
+    if (chunks.length > 0) {
+      try {
+        clientSocket.unshift(Buffer.concat(chunks));
+      } catch (err) {
+        log.proxyErr(`CONNECT unshift failed ${label}: ${err.message}`);
+      }
+    }
+
+    let tlsSocket;
+    try {
+      const secureContext = tls.createSecureContext({
+        key: tlsOptions.key,
+        cert: tlsOptions.cert,
+        minVersion: "TLSv1.2",
+      });
+      tlsSocket = new tls.TLSSocket(clientSocket, {
+        isServer: true,
+        secureContext,
+        rejectUnauthorized: false,
+        handshakeTimeout: 30_000,
+      });
+    } catch (err) {
+      log.proxyErr(`CONNECT TLS wrap create failed ${label}: ${err.message}`);
+      try {
+        clientSocket.destroy();
+      } catch {
+        // ignore
+      }
+      return;
+    }
+
+    log.proxy(`CONNECT ${label} -> LOCAL-WRAP-TLS`);
+
+    tlsSocket.once("secure", () => {
+      log.success(
+        `[Proxy] CONNECT TLS-OK ${label} ALPN=${tlsSocket.alpnProtocol || "none"} ` +
+          `proto=${tlsSocket.getProtocol && tlsSocket.getProtocol()} ` +
+          `(LOCAL-WRAP-TLS)`,
+      );
+      try {
+        tlsSocket.__evejsMitmHandshakeOk = true;
+      } catch {
+        // ignore
+      }
+      // Attach HTTP/1.1 request pipeline (same handler as MITM listener).
+      try {
+        ensureConnectMitmHttpsServer();
+        if (connectMitmHttpsServer) {
+          connectMitmHttpsServer.emit("secureConnection", tlsSocket);
+        }
+      } catch (err) {
+        log.http2Err(
+          `CONNECT WRAP HTTP handoff failed ${label}: ${err.message}`,
+        );
+      }
+    });
+
+    tlsSocket.on("error", (err) => {
+      const msg = String((err && err.message) || err || "");
+      const code = err && err.code;
+      const reason = err && err.reason;
+      if (
+        tlsSocket.__evejsMitmHandshakeOk &&
+        /hang up|ECONNRESET|ECONNABORTED|EPIPE/i.test(msg)
+      ) {
+        log.debug(
+          `connect-wrap post-handshake close: ${msg} code=${code || "n/a"}`,
+        );
+        return;
+      }
+      log.http2Err(
+        `connect-wrap tls error: ${msg} code=${code || "n/a"} ` +
+          `reason=${reason || "n/a"}`,
+      );
+    });
+  });
+
+  return true;
+}
+
+/**
  * Tunnel CONNECT through a clean loopback HTTPS (HTTP/1.1) listener.
  *
  * Order matters for Node's HTTP CONNECT socket + remote SslStream:
  *   1) pause client (Node may already have paused it)
  *   2) dial MITM loopback
  *   3) write "200 Connection Established" and wait for write callback
- *   4) splice bytes (head + data) with wireTunnel
+ *   4) splice bytes (head + data)
  *   5) resume client
  *
  * The previous "200-first + early close handlers" path produced ▲0B ▼0B
@@ -1651,12 +1794,42 @@ function startServer() {
       return;
     }
 
-    // Preferred: classic tunnel into dedicated HTTP/1.1 HTTPS MITM.
+    // Gateway intercept: prefer in-process TLS wrap (one less hop than MITM).
+    // Fall back to loopback MITM HTTPS if wrap cannot start.
     if (interceptTarget && shouldHandleInterceptLocally()) {
+      const mode = String(process.env.EVEJS_CONNECT_TLS_MODE || "wrap")
+        .trim()
+        .toLowerCase();
+      if (mode === "mitm") {
+        if (attachConnectViaMitmHttpsTunnel(clientSocket, head, targetRaw)) {
+          return;
+        }
+        ensureConnectMitmHttpsServerAsync()
+          .then(() => {
+            if (!attachConnectViaMitmHttpsTunnel(clientSocket, head, targetRaw)) {
+              clientSocket.write("HTTP/1.1 502 Bad Gateway\r\n\r\n");
+              clientSocket.destroy();
+            }
+          })
+          .catch(() => {
+            try {
+              clientSocket.write("HTTP/1.1 502 Bad Gateway\r\n\r\n");
+            } catch {
+              // ignore
+            }
+            clientSocket.destroy();
+          });
+        return;
+      }
+      // default: wrap
+      if (attachConnectTlsWrap(clientSocket, head, targetRaw)) {
+        // Warm MITM https server so secureConnection handoff has a listener.
+        ensureConnectMitmHttpsServerAsync().catch(() => {});
+        return;
+      }
       if (attachConnectViaMitmHttpsTunnel(clientSocket, head, targetRaw)) {
         return;
       }
-      // MITM not ready yet — try to start and queue a short retry via fallback.
       ensureConnectMitmHttpsServerAsync()
         .then(() => {
           if (!attachConnectViaMitmHttpsTunnel(clientSocket, head, targetRaw)) {
