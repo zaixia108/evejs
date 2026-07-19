@@ -63,6 +63,7 @@ call :EnsureServerDependencies
 if errorlevel 1 exit /b 1
 
 set "EVEJS_PROXY_LOCAL_INTERCEPT=1"
+set "EVEJS_PROXY_GATEWAY_MODE=local"
 if not exist "%EVEJS_REPO_ROOT%\server\logs\node-reports" mkdir "%EVEJS_REPO_ROOT%\server\logs\node-reports" >nul 2>&1
 
 echo.

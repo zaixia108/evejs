@@ -395,11 +395,15 @@ def start_evejs_server(log: LogFn | None = None) -> ProcessHandle:
         raise RuntimeError("npm not found on PATH")
 
     env = os.environ.copy()
+    # Must stay 1 for multiplayer/domain/FRP: otherwise CONNECT to
+    # public-gateway dials real CCP and TLS fails with connection reset.
     env["EVEJS_PROXY_LOCAL_INTERCEPT"] = "1"
+    env["EVEJS_PROXY_GATEWAY_MODE"] = env.get("EVEJS_PROXY_GATEWAY_MODE") or "local"
     env["EVEJS_GAMESTORE_DATA_DIR"] = str(root / "_local" / "gameStore" / "data")
     (root / "server" / "logs" / "node-reports").mkdir(parents=True, exist_ok=True)
 
     _log(log, "info", "Starting EveJS server in a new console window...")
+    _log(log, "info", "EVEJS_PROXY_LOCAL_INTERCEPT=1 (local public-gateway TLS)")
 
     if sys.platform == "win32":
         # New CMD window, keep open on exit (/k) so user can read crash logs.
@@ -410,6 +414,7 @@ def start_evejs_server(log: LogFn | None = None) -> ProcessHandle:
             f'title EveJS Server & '
             f'cd /d "{server_dir}" & '
             f"set EVEJS_PROXY_LOCAL_INTERCEPT=1 & "
+            f"set EVEJS_PROXY_GATEWAY_MODE=local & "
             f'set EVEJS_GAMESTORE_DATA_DIR={data_dir} & '
             f"npm start"
         )

@@ -57,6 +57,22 @@ try {
   Write-Info "Check FRP tunnel for TCP $proxyPort and that EveJS is running on the host."
 }
 
+Write-Title "1b) Proxy /health (local intercept flags)"
+try {
+  $ph = Invoke-RestMethod -TimeoutSec 8 -Uri ("{0}health" -f $proxyBase)
+  Write-Info ("gatewayMode={0} localIntercept={1} localSecureResponder={2}" -f $ph.gatewayMode, $ph.localIntercept, $ph.localSecureResponder)
+  if ("$($ph.localIntercept)" -eq "False" -or "$($ph.localIntercept)" -eq "false") {
+    Write-Bad "localIntercept is FALSE — CONNECT will dial real CCP and TLS usually resets"
+    Write-Info "On server set EVEJS_PROXY_LOCAL_INTERCEPT=1 and restart (Server launcher does this)."
+  } elseif ("$($ph.localSecureResponder)" -eq "False" -or "$($ph.localSecureResponder)" -eq "false") {
+    Write-Bad "localSecureResponder is FALSE — gateway TLS stub not listening"
+  } else {
+    Write-Ok "local intercept + secure responder look enabled"
+  }
+} catch {
+  Write-Bad "GET /health failed: $($_.Exception.Message)"
+}
+
 # ── 2) CA ───────────────────────────────────────────────────────────────────
 Write-Title "2) Download live CA from host"
 try {

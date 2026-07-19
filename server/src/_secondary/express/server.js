@@ -38,12 +38,16 @@ function getGatewayBinaryAsset(routePath) {
 }
 
 function shouldEnableLocalInterceptByDefault() {
-  try {
-    const redirectUrl = new URL(config.microservicesRedirectUrl);
-    return isLoopbackHost(redirectUrl.hostname);
-  } catch {
-    return false;
-  }
+  // Always intercept CCP public-gateway / LaunchDarkly by default.
+  //
+  // Older logic only enabled intercept when microservicesRedirectUrl was
+  // loopback. Multiplayer/DDNS/FRP sets that URL to the public hostname, which
+  // silently disabled intercept — CONNECT then dialed real CCP hosts and the
+  // TLS handshake was reset (Diagnose: CONNECT 200, then "connection closed").
+  //
+  // Override with EVEJS_PROXY_LOCAL_INTERCEPT=0 if you intentionally want
+  // transparent forward of those hosts.
+  return true;
 }
 
 function parseBooleanEnv(value, fallback = false) {
@@ -1157,6 +1161,8 @@ function startServer() {
         : shouldHandleInterceptLocally()
           ? "local"
           : "transparent",
+      localIntercept: shouldHandleInterceptLocally(),
+      localSecureResponder: Boolean(localSecureResponderServer),
       upstreamBaseUrl: PROXY_FORWARD_UPSTREAM_URL
         ? PROXY_FORWARD_UPSTREAM_URL.toString()
         : null,
