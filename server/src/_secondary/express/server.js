@@ -885,19 +885,63 @@ function ensureConnectMitmHttpsServer() {
     return connectMitmHttpsServer;
   }
   const { tlsOptions } = loadLocalTlsOptions();
+  // Prefer TLS1.2 for SChannel/Diagnose and FRP paths; TLS1.3 is still allowed.
   connectMitmHttpsServer = https.createServer(
     {
       key: tlsOptions.key,
       cert: tlsOptions.cert,
       minVersion: "TLSv1.2",
-      // Diagnose.ps1 / SslStream and most CCP clients speak HTTP/1.1 after CONNECT.
+      // Diagnose.ps1 / SslStream: HTTP/1.1 only (no h2 preface).
       ALPNProtocols: ["http/1.1"],
     },
     handleConnectMitmHttpRequest,
   );
-  connectMitmHttpsServer.on("tlsClientError", (err) => {
+  connectMitmHttpsServer.on("secureConnection", (tlsSocket) => {
+    log.success(
+      `[Proxy] CONNECT TLS-OK ALPN=${tlsSocket.alpnProtocol || "none"} ` +
+        `proto=${tlsSocket.getProtocol && tlsSocket.getProtocol()} ` +
+        `(LOCAL-MITM-HTTPS)`,
+    );
+    // Mark so hang-ups after a successful handshake (Diagnose dispose) are quieter.
+    try {
+      tlsSocket.__evejsMitmHandshakeOk = true;
+    } catch {
+      // ignore
+    }
+    tlsSocket.on("error", (err) => {
+      if (
+        tlsSocket.__evejsMitmHandshakeOk &&
+        /hang up|ECONNRESET|ECONNABORTED|EPIPE/i.test(String(err && err.message))
+      ) {
+        log.debug(
+          `connect-mitm post-handshake close: ${err.message} code=${err.code || "n/a"}`,
+        );
+        return;
+      }
+      log.http2Err(
+        `connect-mitm socket error: ${err.message} code=${err.code || "n/a"}`,
+      );
+    });
+  });
+  connectMitmHttpsServer.on("tlsClientError", (err, tlsSocket) => {
+    // Diagnose/game often close right after handshake without an HTTP request.
+    // That surfaces as socket hang up / ECONNRESET — not a cert failure.
+    const msg = String((err && err.message) || err || "");
+    const code = err && err.code;
+    const handshakeOk = tlsSocket && tlsSocket.__evejsMitmHandshakeOk;
+    if (
+      handshakeOk ||
+      code === "ECONNRESET" ||
+      /hang up|ECONNRESET|ECONNABORTED/i.test(msg)
+    ) {
+      log.debug(
+        `connect-mitm tls client close: ${msg} code=${code || "n/a"}` +
+          (handshakeOk ? " (after TLS-OK)" : ""),
+      );
+      return;
+    }
     log.http2Err(
-      `connect-mitm tls client error: ${err.message} code=${err.code || "n/a"}`,
+      `connect-mitm tls client error: ${msg} code=${code || "n/a"}`,
     );
   });
   connectMitmHttpsServer.on("error", (err) => {
@@ -931,6 +975,35 @@ function ensureConnectMitmHttpsServerAsync() {
           `[Proxy] CONNECT MITM HTTPS ready on 127.0.0.1:${connectMitmPort} ` +
             `(HTTP/1.1, path=LOCAL-MITM-HTTPS)`,
         );
+        // Pure loopback TLS self-test (no proxy hop).
+        try {
+          const probe = tls.connect(
+            {
+              host: "127.0.0.1",
+              port: connectMitmPort,
+              servername: "dev-public-gateway.evetech.net",
+              rejectUnauthorized: false,
+              ALPNProtocols: ["http/1.1"],
+              minVersion: "TLSv1.2",
+            },
+            () => {
+              log.success(
+                `[Proxy] MITM self-test TLS OK ALPN=${probe.alpnProtocol || "none"} ` +
+                  `proto=${probe.getProtocol && probe.getProtocol()}`,
+              );
+              probe.end();
+            },
+          );
+          probe.setTimeout(5000, () => {
+            log.http2Err("[Proxy] MITM self-test TLS timeout");
+            probe.destroy();
+          });
+          probe.on("error", (err) => {
+            log.http2Err(`[Proxy] MITM self-test TLS FAIL: ${err.message}`);
+          });
+        } catch (err) {
+          log.http2Err(`[Proxy] MITM self-test setup FAIL: ${err.message}`);
+        }
         resolve(connectMitmPort);
       });
     } catch (err) {
@@ -943,66 +1016,176 @@ function ensureConnectMitmHttpsServerAsync() {
 
 /**
  * Tunnel CONNECT through a clean loopback HTTPS (HTTP/1.1) listener.
- * Classic: CONNECT 200 -> TCP pipe to listening TLS server.
- * Does NOT wrap the http.Server CONNECT socket in tls.TLSSocket
- * (that path logs LOCAL-INPROCESS-TLS and ECONNRESET under FRP).
+ * Reply 200 first, buffer ClientHello until MITM TCP is up, then splice.
+ * Does NOT wrap the http.Server CONNECT socket in tls.TLSSocket.
  */
 function attachConnectViaMitmHttpsTunnel(clientSocket, head, label) {
   if (!connectMitmPort) {
     return false;
   }
 
+  const tunnelLabel = `${label} via MITM 127.0.0.1:${connectMitmPort}`;
+  let upBytes = 0;
+  let downBytes = 0;
+  let closed = false;
+  let upstreamReady = false;
+  /** @type {Buffer[]} */
+  const pendingFromClient = [];
+  if (head && head.length > 0) {
+    pendingFromClient.push(Buffer.from(head));
+    upBytes += head.length;
+  }
+
+  const finish = (why) => {
+    if (closed) {
+      return;
+    }
+    closed = true;
+    log.proxy(
+      `tunnel closed ${tunnelLabel} ▲${upBytes}B ▼${downBytes}B${
+        why ? ` (${why})` : ""
+      }`,
+    );
+    try {
+      if (!clientSocket.destroyed) {
+        clientSocket.destroy();
+      }
+    } catch {
+      // ignore
+    }
+    try {
+      if (upstream && !upstream.destroyed) {
+        upstream.destroy();
+      }
+    } catch {
+      // ignore
+    }
+  };
+
+  // 200 first so remote SslStream can emit ClientHello while we dial loopback.
+  const established =
+    "HTTP/1.1 200 Connection Established\r\n" +
+    "Proxy-Agent: EveJS Elysian\r\n" +
+    "\r\n";
   try {
-    clientSocket.pause();
+    clientSocket.setNoDelay(true);
+    clientSocket.setKeepAlive(true, SOCKET_KEEPALIVE_INITIAL_DELAY_MS);
+    clientSocket.setTimeout(0);
   } catch {
     // ignore
   }
 
-  const upstream = net.connect(
-    { host: "127.0.0.1", port: connectMitmPort },
-    () => {
-      const established =
-        "HTTP/1.1 200 Connection Established\r\n" +
-        "Proxy-Agent: EveJS Elysian\r\n" +
-        "\r\n";
-      clientSocket.write(established, () => {
-        log.proxy(
-          `CONNECT ${label} -> LOCAL-MITM-HTTPS 127.0.0.1:${connectMitmPort}`,
-        );
-        wireTunnel(
-          clientSocket,
-          upstream,
-          head,
-          `${label} via MITM 127.0.0.1:${connectMitmPort}`,
-          { idleTimeoutMs: INTERCEPT_PROXY_TUNNEL_IDLE_TIMEOUT_MS },
-        );
+  log.proxy(
+    `CONNECT ${label} -> LOCAL-MITM-HTTPS 127.0.0.1:${connectMitmPort}`,
+  );
+
+  if (!clientSocket.write(established)) {
+    // rare: wait for drain before accepting more — still dial MITM
+  }
+
+  const upstream = net.connect({ host: "127.0.0.1", port: connectMitmPort });
+
+  const flushPending = () => {
+    while (pendingFromClient.length > 0 && !upstream.destroyed) {
+      const chunk = pendingFromClient.shift();
+      const ok = upstream.write(chunk);
+      if (!ok) {
         try {
-          clientSocket.resume();
+          clientSocket.pause();
         } catch {
           // ignore
         }
-      });
-    },
-  );
-
-  upstream.on("error", (err) => {
-    log.proxyErr(`CONNECT MITM upstream error ${label}: ${err.message}`);
-    if (!clientSocket.destroyed) {
-      try {
-        clientSocket.write("HTTP/1.1 502 Bad Gateway\r\n\r\n");
-      } catch {
-        // ignore
+        break;
       }
-      clientSocket.destroy();
     }
-  });
-  clientSocket.on("error", () => {
+  };
+
+  upstream.on("connect", () => {
+    upstreamReady = true;
     try {
-      upstream.destroy();
+      upstream.setNoDelay(true);
+      upstream.setKeepAlive(true, SOCKET_KEEPALIVE_INITIAL_DELAY_MS);
+      upstream.setTimeout(0);
+    } catch {
+      // ignore
+    }
+    flushPending();
+    try {
+      clientSocket.resume();
     } catch {
       // ignore
     }
   });
+
+  clientSocket.on("data", (chunk) => {
+    upBytes += chunk.length;
+    if (!upstreamReady || upstream.destroyed) {
+      pendingFromClient.push(chunk);
+      return;
+    }
+    const ok = upstream.write(chunk);
+    if (!ok) {
+      try {
+        clientSocket.pause();
+      } catch {
+        // ignore
+      }
+    }
+  });
+
+  upstream.on("data", (chunk) => {
+    downBytes += chunk.length;
+    if (clientSocket.destroyed) {
+      return;
+    }
+    const ok = clientSocket.write(chunk);
+    if (!ok) {
+      try {
+        upstream.pause();
+      } catch {
+        // ignore
+      }
+    }
+  });
+
+  clientSocket.on("drain", () => {
+    if (!upstream.destroyed) {
+      upstream.resume();
+    }
+  });
+  upstream.on("drain", () => {
+    if (!clientSocket.destroyed) {
+      clientSocket.resume();
+    }
+  });
+
+  clientSocket.on("error", () => finish("client-error"));
+  upstream.on("error", (err) => {
+    if (!upstreamReady) {
+      log.proxyErr(`CONNECT MITM upstream error ${label}: ${err.message}`);
+      if (!clientSocket.destroyed) {
+        try {
+          // 200 may already be sent; just tear down tunnel.
+        } catch {
+          // ignore
+        }
+      }
+    }
+    finish("upstream-error");
+  });
+  clientSocket.on("close", () => finish("client-close"));
+  upstream.on("close", () => finish("upstream-close"));
+  clientSocket.on("end", () => {
+    if (upstream && !upstream.destroyed) {
+      upstream.end();
+    }
+  });
+  upstream.on("end", () => {
+    if (!clientSocket.destroyed) {
+      clientSocket.end();
+    }
+  });
+
   return true;
 }
 
@@ -1354,6 +1537,15 @@ function startServer() {
   }
 
   const proxyServer = http.createServer(app);
+  // CONNECT tunnels (TLS-over-proxy) must not be killed by Node 18+ request timeouts.
+  try {
+    proxyServer.timeout = 0;
+    proxyServer.requestTimeout = 0;
+    proxyServer.headersTimeout = 0;
+    proxyServer.keepAliveTimeout = 0;
+  } catch {
+    // ignore older Node
+  }
 
   proxyServer.on("connect", (req, clientSocket, head) => {
     const targetRaw = req.url || "";

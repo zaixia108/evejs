@@ -267,9 +267,10 @@ function Test-GatewayTls {
 
 Write-Title ("5) Gateway TLS via proxy {0}:{1} CONNECT dev-public-gateway.evetech.net:443" -f $hostName, $proxyPort)
 $tls12 = [System.Security.Authentication.SslProtocols]::Tls12
-$okGw = Test-GatewayTls -ProxyHost $hostName -ProxyPort $proxyPort -ProtocolLabel "default SslProtocols" -SslProtocol $null
+# Prefer TLS1.2 first — more reliable through FRP/SChannel than negotiated TLS1.3.
+$okGw = Test-GatewayTls -ProxyHost $hostName -ProxyPort $proxyPort -ProtocolLabel "TLS1.2 only" -SslProtocol $tls12
 if (-not $okGw) {
-  $okGw = Test-GatewayTls -ProxyHost $hostName -ProxyPort $proxyPort -ProtocolLabel "TLS1.2 only" -SslProtocol $tls12
+  $okGw = Test-GatewayTls -ProxyHost $hostName -ProxyPort $proxyPort -ProtocolLabel "default SslProtocols" -SslProtocol $null
 }
 if (-not $okGw) {
   Write-Info "CONNECT 200 + TLS reset often means:"
