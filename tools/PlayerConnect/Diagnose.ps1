@@ -274,11 +274,14 @@ if (-not $okGw) {
 if (-not $okGw) {
   Write-Info "CONNECT 200 + TLS reset often means:"
   Write-Info "  1) Server still on OLD path. Log must show:"
+  Write-Info "       PRX CONNECT ... -> LOCAL-MITM-HTTPS 127.0.0.1:<port>"
+  Write-Info "     Startup should also show: CONNECT MITM HTTPS ready ..."
+  Write-Info "  2) BAD (broken old path):"
   Write-Info "       PRX CONNECT ... -> LOCAL-INPROCESS-TLS"
-  Write-Info "       [Proxy] CONNECT TLS-OK ..."
-  Write-Info "     NOT: -> LOCAL 127.0.0.1:26003"
-  Write-Info "  2) Update the folder that actually runs the server (e.g. GorkServer\EveJS-v0.12.2-GUI), restart."
-  Write-Info "  3) Check GET /health => localIntercept=true, localSecureResponder=true"
+  Write-Info "       H2  inprocess TLSSocket error: read ECONNRESET"
+  Write-Info "  3) BAD (even older): -> LOCAL 127.0.0.1:26003 then hang up"
+  Write-Info "  4) Update the folder that actually runs the server, full restart."
+  Write-Info "  5) GET /health => localIntercept=true, connectMitmHttps=true"
   Write-Info "In-game paid UI also needs CA in client cacert.pem (Client launcher)."
 }
 
@@ -287,13 +290,16 @@ Write-Title "6) How to read host server logs"
 Write-Host @"
   On the SERVER window, while Diagnose runs step 5:
 
-    GOOD (new code):
-      PRX  CONNECT ... -> LOCAL-INPROCESS-TLS
-      [Proxy] CONNECT TLS-OK ... ALPN=...
+    GOOD (current code):
+      [Proxy] CONNECT MITM HTTPS ready on 127.0.0.1:... (HTTP/1.1, path=LOCAL-MITM-HTTPS)
+      PRX  CONNECT ... -> LOCAL-MITM-HTTPS 127.0.0.1:...
 
-    BAD (old code still running):
+    BAD (old in-process TLS wrap — ECONNRESET under FRP):
+      PRX  CONNECT ... -> LOCAL-INPROCESS-TLS
+      H2   inprocess TLSSocket error: read ECONNRESET
+
+    BAD (older loopback pipe only):
       PRX  CONNECT ... -> LOCAL 127.0.0.1:26003
-      H2   tls client error: socket hang up
 
     BAD intercept off:
       PRX  CONNECT ... -> REMOTE dev-public-gateway.evetech.net:443
@@ -302,7 +308,7 @@ Write-Host @"
   (e.g. C:\server\GorkServer\EveJS-v0.12.2-GUI), then fully restart.
 
   health / ca.pem only prove HTTP :$proxyPort.
-  Chat needs TLS :$xmppPort. Gateway needs CONNECT + TLS-OK.
+  Chat needs TLS :$xmppPort. Gateway needs CONNECT + LOCAL-MITM-HTTPS.
 "@ -ForegroundColor DarkGray
 
 Write-Host ""

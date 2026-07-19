@@ -15,9 +15,15 @@ const {
 
 let gatewayStreamHandler = null;
 let mapTagsCdnAssetResolver = null;
-// Shared HTTPS/h2 responder used both on loopback :port+1 and for in-process
-// CONNECT intercept (FRP-safe: no second hop after the outer proxy socket).
+// Shared HTTPS/h2 responder on loopback :httpPort+1 (self-test / legacy).
 let localSecureResponderServer = null;
+// Dedicated HTTP/1.1 HTTPS MITM for CONNECT intercept. Classic TCP tunnel to a
+// clean listening socket — more reliable than wrapping the http.Server CONNECT
+// socket in TLSSocket (that path ECONNRESETs under FRP for many clients).
+let connectMitmHttpsServer = null;
+let connectMitmPort = null;
+/** @type {Promise<number>|null} */
+let connectMitmListenPromise = null;
 
 function getGatewayStreamHandler() {
   if (!gatewayStreamHandler) {
@@ -813,8 +819,8 @@ function createLocalSecureResponder(httpsPort, bindHost) {
   localSecureResponderServer = secureServer;
   secureServer.listen(httpsPort, bindHost, () => {
     log.success(
-      `[Proxy] local public-gateway TLS ready on ${bindHost}:${httpsPort} ` +
-        `(CONNECT path=LOCAL-INPROCESS-TLS, intercept=${shouldHandleInterceptLocally()})`,
+      `[Proxy] local public-gateway h2 responder on ${bindHost}:${httpsPort} ` +
+        `(self-test/legacy; CONNECT uses LOCAL-MITM-HTTPS, intercept=${shouldHandleInterceptLocally()})`,
     );
     // Pure TLS self-test (no HTTP/2 preface). If this fails, certs/keys are bad.
     try {
@@ -850,196 +856,153 @@ function localInterceptConnectHostForProbe(bindHost) {
   return resolveLocalInterceptConnectHost(bindHost);
 }
 
-let connectGatewayHttpsServer = null;
-
-function getConnectGatewayHttpsServer() {
-  if (connectGatewayHttpsServer) {
-    return connectGatewayHttpsServer;
+function handleConnectMitmHttpRequest(req, res) {
+  if (handleLaunchDarklyHttpRequest(req, res)) {
+    return;
   }
-  const { tlsOptions } = loadLocalTlsOptions();
-  // HTTP/1.1 HTTPS server used only as a handoff target for non-h2 ALPN.
-  // Never .listen() — sockets are attached via emit("connection").
-  connectGatewayHttpsServer = https.createServer(
-    {
-      key: tlsOptions.key,
-      cert: tlsOptions.cert,
-      ALPNProtocols: ["http/1.1"],
-    },
-    (req, res) => {
-      if (handleLaunchDarklyHttpRequest(req, res)) {
-        return;
-      }
-      res.writeHead(200, { "content-type": "application/json" });
-      res.end(JSON.stringify(makeHttp1Payload(req)));
-    },
-  );
-  connectGatewayHttpsServer.on("tlsClientError", (err) => {
-    log.http2Err(
-      `connect-https tls client error: ${err.message} code=${err.code || "n/a"}`,
-    );
-  });
-  return connectGatewayHttpsServer;
-}
-
-function stripInheritedSocketListeners(socket) {
-  // http.Server CONNECT leaves the socket with leftover listeners that can
-  // steal ClientHello bytes once TLS starts.
-  for (const eventName of [
-    "data",
-    "readable",
-    "end",
-    "drain",
-    "timeout",
-    "finish",
-  ]) {
-    try {
-      socket.removeAllListeners(eventName);
-    } catch {
-      // ignore
-    }
+  const routePath = String((req.url || "").split("?")[0] || "/");
+  const binaryAsset =
+    String(req.method || "").toUpperCase() === "GET"
+      ? getGatewayBinaryAsset(routePath)
+      : null;
+  if (binaryAsset) {
+    res.writeHead(200, buildBinaryAssetHeaders(binaryAsset));
+    res.end(binaryAsset.buffer);
+    return;
   }
+  res.writeHead(200, { "content-type": "application/json" });
+  res.end(JSON.stringify(makeHttp1Payload(req)));
 }
 
 /**
- * Terminate public-gateway TLS on the CONNECT client socket itself.
- *
- * Flow:
- *  1) HTTP 200 Connection Established
- *  2) Server-side TLS on the same TCP socket (no loopback hop)
- *  3) Only after the first application byte, attach HTTP/2 or HTTP/1.1
- *
- * Step 3 is critical: attaching Http2SecureServer immediately after TLS makes
- * Node wait for the HTTP/2 connection preface. Diagnose/SslStream clients only
- * finish the TLS handshake and send no preface → server RST → client error
- * "远程主机强迫关闭了一个现有的连接".
+ * Dedicated HTTP/1.1 HTTPS server for CONNECT intercept.
+ * Classic pattern: client CONNECT -> 200 -> TCP pipe -> this server's TLS.
+ * Avoids wrapping the http.Server CONNECT socket in TLSSocket (ECONNRESET under
+ * FRP) and avoids HTTP/2 preface requirements that break Diagnose/SslStream.
  */
-function attachConnectSocketToLocalSecureResponder(clientSocket, head, label) {
-  if (!localSecureResponderServer) {
+function ensureConnectMitmHttpsServer() {
+  if (connectMitmHttpsServer) {
+    return connectMitmHttpsServer;
+  }
+  const { tlsOptions } = loadLocalTlsOptions();
+  connectMitmHttpsServer = https.createServer(
+    {
+      key: tlsOptions.key,
+      cert: tlsOptions.cert,
+      minVersion: "TLSv1.2",
+      // Diagnose.ps1 / SslStream and most CCP clients speak HTTP/1.1 after CONNECT.
+      ALPNProtocols: ["http/1.1"],
+    },
+    handleConnectMitmHttpRequest,
+  );
+  connectMitmHttpsServer.on("tlsClientError", (err) => {
+    log.http2Err(
+      `connect-mitm tls client error: ${err.message} code=${err.code || "n/a"}`,
+    );
+  });
+  connectMitmHttpsServer.on("error", (err) => {
+    log.http2Err(`connect-mitm server error: ${err.message}`);
+  });
+  return connectMitmHttpsServer;
+}
+
+function ensureConnectMitmHttpsServerAsync() {
+  if (connectMitmPort) {
+    return Promise.resolve(connectMitmPort);
+  }
+  if (connectMitmListenPromise) {
+    return connectMitmListenPromise;
+  }
+
+  connectMitmListenPromise = new Promise((resolve, reject) => {
+    try {
+      const server = ensureConnectMitmHttpsServer();
+      if (connectMitmPort) {
+        resolve(connectMitmPort);
+        return;
+      }
+      server.once("error", (err) => {
+        connectMitmListenPromise = null;
+        reject(err);
+      });
+      server.listen(0, "127.0.0.1", () => {
+        connectMitmPort = server.address().port;
+        log.success(
+          `[Proxy] CONNECT MITM HTTPS ready on 127.0.0.1:${connectMitmPort} ` +
+            `(HTTP/1.1, path=LOCAL-MITM-HTTPS)`,
+        );
+        resolve(connectMitmPort);
+      });
+    } catch (err) {
+      connectMitmListenPromise = null;
+      reject(err);
+    }
+  });
+  return connectMitmListenPromise;
+}
+
+/**
+ * Tunnel CONNECT through a clean loopback HTTPS (HTTP/1.1) listener.
+ * Classic: CONNECT 200 -> TCP pipe to listening TLS server.
+ * Does NOT wrap the http.Server CONNECT socket in tls.TLSSocket
+ * (that path logs LOCAL-INPROCESS-TLS and ECONNRESET under FRP).
+ */
+function attachConnectViaMitmHttpsTunnel(clientSocket, head, label) {
+  if (!connectMitmPort) {
     return false;
   }
 
-  const { tlsOptions } = loadLocalTlsOptions();
-  const established =
-    "HTTP/1.1 200 Connection Established\r\n" +
-    "Proxy-Agent: EveJS Elysian\r\n" +
-    "\r\n";
-
-  const beginTls = () => {
-    try {
-      stripInheritedSocketListeners(clientSocket);
-
-      // Re-queue any early body bytes (pipelined ClientHello).
-      const chunks = [];
-      if (head && head.length > 0) {
-        chunks.push(Buffer.isBuffer(head) ? head : Buffer.from(head));
-      }
-      try {
-        clientSocket.resume();
-      } catch {
-        // ignore
-      }
-      let buffered;
-      try {
-        while ((buffered = clientSocket.read()) !== null) {
-          chunks.push(buffered);
-        }
-      } catch {
-        // ignore
-      }
-      if (chunks.length > 0) {
-        clientSocket.unshift(Buffer.concat(chunks));
-      }
-
-      try {
-        clientSocket.setNoDelay(true);
-        clientSocket.setKeepAlive(true, SOCKET_KEEPALIVE_INITIAL_DELAY_MS);
-      } catch {
-        // ignore
-      }
-
-      const tlsSocket = new tls.TLSSocket(clientSocket, {
-        isServer: true,
-        key: tlsOptions.key,
-        cert: tlsOptions.cert,
-        // Offer both; clients that do not speak ALPN fall through to HTTP/1.1.
-        ALPNProtocols: ["h2", "http/1.1"],
-        handshakeTimeout: 60_000,
-        rejectUnauthorized: false,
-      });
-
-      let handedOff = false;
-      const handoff = (firstChunk) => {
-        if (handedOff) {
-          return;
-        }
-        handedOff = true;
-        try {
-          if (firstChunk && firstChunk.length) {
-            tlsSocket.unshift(firstChunk);
-          }
-          const alpn = String(tlsSocket.alpnProtocol || "");
-          const isH2 =
-            alpn === "h2" || alpn === "h2-14" || alpn === "h2-16" || alpn === "h2-15";
-          if (isH2) {
-            localSecureResponderServer.emit("secureConnection", tlsSocket);
-            log.http2Log(`http2 handoff (inprocess) ALPN=${alpn || "none"}`);
-          } else {
-            // HTTP/1.1 (or no ALPN): use https.Server request pipeline.
-            getConnectGatewayHttpsServer().emit("secureConnection", tlsSocket);
-            log.http2Log(`http1 handoff (inprocess) ALPN=${alpn || "none"}`);
-          }
-        } catch (err) {
-          log.http2Err(`app-layer handoff failed: ${err.message}`);
-          try {
-            tlsSocket.destroy();
-          } catch {
-            // ignore
-          }
-        }
-      };
-
-      tlsSocket.on("error", (err) => {
-        log.http2Err(
-          `inprocess TLSSocket error: ${err.message} code=${err.code || "n/a"}`,
-        );
-      });
-
-      tlsSocket.once("secure", () => {
-        // TLS finished successfully. Diagnose AuthenticateAsClient can return OK
-        // even if the client never sends HTTP bytes.
-        log.success(
-          `[Proxy] CONNECT TLS-OK ${label} ALPN=${tlsSocket.alpnProtocol || "none"}`,
-        );
-        tlsSocket.once("data", (chunk) => {
-          handoff(chunk);
-        });
-      });
-
-      log.proxy(`CONNECT ${label} -> LOCAL-INPROCESS-TLS`);
-    } catch (err) {
-      log.proxyErr(
-        `in-process TLS attach failed for ${label}: ${err.message}`,
-      );
-      try {
-        clientSocket.destroy();
-      } catch {
-        // ignore
-      }
-    }
-  };
-
   try {
-    clientSocket.write(established, () => {
-      beginTls();
-    });
-  } catch (err) {
-    log.proxyErr(`CONNECT 200 write failed for ${label}: ${err.message}`);
-    try {
+    clientSocket.pause();
+  } catch {
+    // ignore
+  }
+
+  const upstream = net.connect(
+    { host: "127.0.0.1", port: connectMitmPort },
+    () => {
+      const established =
+        "HTTP/1.1 200 Connection Established\r\n" +
+        "Proxy-Agent: EveJS Elysian\r\n" +
+        "\r\n";
+      clientSocket.write(established, () => {
+        log.proxy(
+          `CONNECT ${label} -> LOCAL-MITM-HTTPS 127.0.0.1:${connectMitmPort}`,
+        );
+        wireTunnel(
+          clientSocket,
+          upstream,
+          head,
+          `${label} via MITM 127.0.0.1:${connectMitmPort}`,
+          { idleTimeoutMs: INTERCEPT_PROXY_TUNNEL_IDLE_TIMEOUT_MS },
+        );
+        try {
+          clientSocket.resume();
+        } catch {
+          // ignore
+        }
+      });
+    },
+  );
+
+  upstream.on("error", (err) => {
+    log.proxyErr(`CONNECT MITM upstream error ${label}: ${err.message}`);
+    if (!clientSocket.destroyed) {
+      try {
+        clientSocket.write("HTTP/1.1 502 Bad Gateway\r\n\r\n");
+      } catch {
+        // ignore
+      }
       clientSocket.destroy();
+    }
+  });
+  clientSocket.on("error", () => {
+    try {
+      upstream.destroy();
     } catch {
       // ignore
     }
-  }
+  });
   return true;
 }
 
@@ -1341,6 +1304,8 @@ function startServer() {
           : "transparent",
       localIntercept: shouldHandleInterceptLocally(),
       localSecureResponder: Boolean(localSecureResponderServer),
+      connectMitmHttps: Boolean(connectMitmPort),
+      connectMitmPort: connectMitmPort || null,
       upstreamBaseUrl: PROXY_FORWARD_UPSTREAM_URL
         ? PROXY_FORWARD_UPSTREAM_URL.toString()
         : null,
@@ -1382,6 +1347,10 @@ function startServer() {
       LOOPBACK_CDN_LISTEN_PORT,
       localInterceptListenHost,
     );
+    // Dedicated HTTP/1.1 HTTPS for CONNECT (Diagnose + FRP-friendly).
+    ensureConnectMitmHttpsServerAsync().catch((err) => {
+      log.http2Err(`[Proxy] CONNECT MITM HTTPS failed to start: ${err.message}`);
+    });
   }
 
   const proxyServer = http.createServer(app);
@@ -1425,26 +1394,35 @@ function startServer() {
       return;
     }
 
-    // Preferred path for public-gateway / LaunchDarkly: terminate TLS in-process
-    // on this CONNECT socket (works better through FRP than loopback re-connect).
+    // Preferred: classic tunnel into dedicated HTTP/1.1 HTTPS MITM.
     if (interceptTarget && shouldHandleInterceptLocally()) {
-      if (
-        attachConnectSocketToLocalSecureResponder(clientSocket, head, targetRaw)
-      ) {
+      if (attachConnectViaMitmHttpsTunnel(clientSocket, head, targetRaw)) {
         return;
       }
-      // Fall through to loopback tunnel if secure responder is not ready yet.
+      // MITM not ready yet — try to start and queue a short retry via fallback.
+      ensureConnectMitmHttpsServerAsync()
+        .then(() => {
+          if (!attachConnectViaMitmHttpsTunnel(clientSocket, head, targetRaw)) {
+            clientSocket.write("HTTP/1.1 502 Bad Gateway\r\n\r\n");
+            clientSocket.destroy();
+          }
+        })
+        .catch(() => {
+          try {
+            clientSocket.write("HTTP/1.1 502 Bad Gateway\r\n\r\n");
+          } catch {
+            // ignore
+          }
+          clientSocket.destroy();
+        });
+      return;
     }
 
     let connectHost = host;
     let connectPort = port;
     let modeLabel = "REMOTE";
 
-    if (interceptTarget && shouldHandleInterceptLocally()) {
-      connectHost = localInterceptConnectHost;
-      connectPort = httpsPort;
-      modeLabel = "LOCAL";
-    } else if (interceptTarget && shouldForwardInterceptToUpstream()) {
+    if (interceptTarget && shouldForwardInterceptToUpstream()) {
       const upstreamTarget = getGatewayUpstreamTarget(httpsPort);
       if (upstreamTarget) {
         connectHost = upstreamTarget.host;
@@ -1455,8 +1433,6 @@ function startServer() {
 
     log.proxy(`CONNECT ${targetRaw} -> ${modeLabel} ${connectHost}:${connectPort}`);
 
-    // Pause until upstream is ready + 200 is fully flushed, so early TLS
-    // ClientHello bytes (common with aggressive clients / FRP) are not dropped.
     try {
       clientSocket.pause();
     } catch {
