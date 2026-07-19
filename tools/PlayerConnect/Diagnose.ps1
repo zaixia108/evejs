@@ -57,22 +57,6 @@ try {
   Write-Info "Check FRP tunnel for TCP $proxyPort and that EveJS is running on the host."
 }
 
-Write-Title "1b) Proxy /health (local intercept flags)"
-try {
-  $ph = Invoke-RestMethod -TimeoutSec 8 -Uri ("{0}health" -f $proxyBase)
-  Write-Info ("gatewayMode={0} localIntercept={1} localSecureResponder={2}" -f $ph.gatewayMode, $ph.localIntercept, $ph.localSecureResponder)
-  if ("$($ph.localIntercept)" -eq "False" -or "$($ph.localIntercept)" -eq "false") {
-    Write-Bad "localIntercept is FALSE — CONNECT will dial real CCP and TLS usually resets"
-    Write-Info "On server set EVEJS_PROXY_LOCAL_INTERCEPT=1 and restart (Server launcher does this)."
-  } elseif ("$($ph.localSecureResponder)" -eq "False" -or "$($ph.localSecureResponder)" -eq "false") {
-    Write-Bad "localSecureResponder is FALSE — gateway TLS stub not listening"
-  } else {
-    Write-Ok "local intercept + secure responder look enabled"
-  }
-} catch {
-  Write-Bad "GET /health failed: $($_.Exception.Message)"
-}
-
 # ── 2) CA ───────────────────────────────────────────────────────────────────
 Write-Title "2) Download live CA from host"
 try {
@@ -289,34 +273,36 @@ if (-not $okGw) {
 }
 if (-not $okGw) {
   Write-Info "CONNECT 200 + TLS reset often means:"
-  Write-Info "  1) Host needs updated proxy tunnel code (sync server + restart)"
-  Write-Info "  2) Host log shows: H2 tls client error / socket hang up"
-  Write-Info "  3) FRP OK for HTTP (health) but TLS-over-CONNECT is flaky — try LAN once to compare"
-  Write-Info "In-game paid UI also needs CA in client cacert.pem (use Client launcher)."
+  Write-Info "  1) Server still on OLD path. Log must show:"
+  Write-Info "       PRX CONNECT ... -> LOCAL-INPROCESS-TLS"
+  Write-Info "       [Proxy] CONNECT TLS-OK ..."
+  Write-Info "     NOT: -> LOCAL 127.0.0.1:26003"
+  Write-Info "  2) Update the folder that actually runs the server (e.g. GorkServer\EveJS-v0.12.2-GUI), restart."
+  Write-Info "  3) Check GET /health => localIntercept=true, localSecureResponder=true"
+  Write-Info "In-game paid UI also needs CA in client cacert.pem (Client launcher)."
 }
 
 # ── 6) How to read server logs ──────────────────────────────────────────────
 Write-Title "6) How to read host server logs"
 Write-Host @"
-  On the SERVER window, after a client launches:
+  On the SERVER window, while Diagnose runs step 5:
 
-    GOOD tunnel:
-      PRX  CONNECT dev-public-gateway.evetech.net:443 -> LOCAL 127.0.0.1:26003
-      H2   tls established ...
+    GOOD (new code):
+      PRX  CONNECT ... -> LOCAL-INPROCESS-TLS
+      [Proxy] CONNECT TLS-OK ... ALPN=...
 
-    BAD tunnel (old code):
-      PRX  CONNECT ... -> LOCAL 0.0.0.0:26003
-
-    BAD cert trust:
+    BAD (old code still running):
+      PRX  CONNECT ... -> LOCAL 127.0.0.1:26003
       H2   tls client error: socket hang up
-      [XMPP] TLS client error: socket hang up
 
-    BAD XMPP name (domain/FRP):
-      Diagnose shows leaf Subject=CN=192.168.x.x but host is a domain
-      -> rebuild XMPP cert for the domain (see step 4 FAIL hints)
+    BAD intercept off:
+      PRX  CONNECT ... -> REMOTE dev-public-gateway.evetech.net:443
+
+  Deploy the latest server.js into the folder that actually runs EveJS
+  (e.g. C:\server\GorkServer\EveJS-v0.12.2-GUI), then fully restart.
 
   health / ca.pem only prove HTTP :$proxyPort.
-  Chat needs TLS :$xmppPort. Gateway needs proxy CONNECT + TLS.
+  Chat needs TLS :$xmppPort. Gateway needs CONNECT + TLS-OK.
 "@ -ForegroundColor DarkGray
 
 Write-Host ""

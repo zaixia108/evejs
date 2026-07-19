@@ -850,17 +850,68 @@ function localInterceptConnectHostForProbe(bindHost) {
   return resolveLocalInterceptConnectHost(bindHost);
 }
 
+let connectGatewayHttpsServer = null;
+
+function getConnectGatewayHttpsServer() {
+  if (connectGatewayHttpsServer) {
+    return connectGatewayHttpsServer;
+  }
+  const { tlsOptions } = loadLocalTlsOptions();
+  // HTTP/1.1 HTTPS server used only as a handoff target for non-h2 ALPN.
+  // Never .listen() — sockets are attached via emit("connection").
+  connectGatewayHttpsServer = https.createServer(
+    {
+      key: tlsOptions.key,
+      cert: tlsOptions.cert,
+      ALPNProtocols: ["http/1.1"],
+    },
+    (req, res) => {
+      if (handleLaunchDarklyHttpRequest(req, res)) {
+        return;
+      }
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify(makeHttp1Payload(req)));
+    },
+  );
+  connectGatewayHttpsServer.on("tlsClientError", (err) => {
+    log.http2Err(
+      `connect-https tls client error: ${err.message} code=${err.code || "n/a"}`,
+    );
+  });
+  return connectGatewayHttpsServer;
+}
+
+function stripInheritedSocketListeners(socket) {
+  // http.Server CONNECT leaves the socket with leftover listeners that can
+  // steal ClientHello bytes once TLS starts.
+  for (const eventName of [
+    "data",
+    "readable",
+    "end",
+    "drain",
+    "timeout",
+    "finish",
+  ]) {
+    try {
+      socket.removeAllListeners(eventName);
+    } catch {
+      // ignore
+    }
+  }
+}
+
 /**
  * Terminate public-gateway TLS on the CONNECT client socket itself.
  *
- * Important: do NOT attach the Http2SecureServer session until the client
- * sends the first application-data byte. Emitting secureConnection immediately
- * makes Node wait for the HTTP/2 connection preface; Diagnose / some SslStream
- * clients only complete the TLS handshake and send no preface, so the server
- * RST mid-AuthenticateAsClient (CONNECT 200 OK, then "connection closed").
+ * Flow:
+ *  1) HTTP 200 Connection Established
+ *  2) Server-side TLS on the same TCP socket (no loopback hop)
+ *  3) Only after the first application byte, attach HTTP/2 or HTTP/1.1
  *
- * EVE still works: after TLS it immediately sends h2 preface / requests, which
- * triggers the lazy handoff below.
+ * Step 3 is critical: attaching Http2SecureServer immediately after TLS makes
+ * Node wait for the HTTP/2 connection preface. Diagnose/SslStream clients only
+ * finish the TLS handshake and send no preface → server RST → client error
+ * "远程主机强迫关闭了一个现有的连接".
  */
 function attachConnectSocketToLocalSecureResponder(clientSocket, head, label) {
   if (!localSecureResponderServer) {
@@ -875,9 +926,30 @@ function attachConnectSocketToLocalSecureResponder(clientSocket, head, label) {
 
   const beginTls = () => {
     try {
+      stripInheritedSocketListeners(clientSocket);
+
+      // Re-queue any early body bytes (pipelined ClientHello).
+      const chunks = [];
       if (head && head.length > 0) {
-        clientSocket.unshift(head);
+        chunks.push(Buffer.isBuffer(head) ? head : Buffer.from(head));
       }
+      try {
+        clientSocket.resume();
+      } catch {
+        // ignore
+      }
+      let buffered;
+      try {
+        while ((buffered = clientSocket.read()) !== null) {
+          chunks.push(buffered);
+        }
+      } catch {
+        // ignore
+      }
+      if (chunks.length > 0) {
+        clientSocket.unshift(Buffer.concat(chunks));
+      }
+
       try {
         clientSocket.setNoDelay(true);
         clientSocket.setKeepAlive(true, SOCKET_KEEPALIVE_INITIAL_DELAY_MS);
@@ -889,13 +961,14 @@ function attachConnectSocketToLocalSecureResponder(clientSocket, head, label) {
         isServer: true,
         key: tlsOptions.key,
         cert: tlsOptions.cert,
-        ALPNProtocols: tlsOptions.ALPNProtocols || ["h2", "http/1.1"],
-        handshakeTimeout: 30_000,
+        // Offer both; clients that do not speak ALPN fall through to HTTP/1.1.
+        ALPNProtocols: ["h2", "http/1.1"],
+        handshakeTimeout: 60_000,
         rejectUnauthorized: false,
       });
 
       let handedOff = false;
-      const handoffToHttp2 = (firstChunk) => {
+      const handoff = (firstChunk) => {
         if (handedOff) {
           return;
         }
@@ -904,12 +977,19 @@ function attachConnectSocketToLocalSecureResponder(clientSocket, head, label) {
           if (firstChunk && firstChunk.length) {
             tlsSocket.unshift(firstChunk);
           }
-          localSecureResponderServer.emit("secureConnection", tlsSocket);
-          log.http2Log(
-            `http handoff (inprocess) ALPN=${tlsSocket.alpnProtocol || "none"}`,
-          );
+          const alpn = String(tlsSocket.alpnProtocol || "");
+          const isH2 =
+            alpn === "h2" || alpn === "h2-14" || alpn === "h2-16" || alpn === "h2-15";
+          if (isH2) {
+            localSecureResponderServer.emit("secureConnection", tlsSocket);
+            log.http2Log(`http2 handoff (inprocess) ALPN=${alpn || "none"}`);
+          } else {
+            // HTTP/1.1 (or no ALPN): use https.Server request pipeline.
+            getConnectGatewayHttpsServer().emit("secureConnection", tlsSocket);
+            log.http2Log(`http1 handoff (inprocess) ALPN=${alpn || "none"}`);
+          }
         } catch (err) {
-          log.http2Err(`secureConnection handoff failed: ${err.message}`);
+          log.http2Err(`app-layer handoff failed: ${err.message}`);
           try {
             tlsSocket.destroy();
           } catch {
@@ -925,12 +1005,13 @@ function attachConnectSocketToLocalSecureResponder(clientSocket, head, label) {
       });
 
       tlsSocket.once("secure", () => {
-        log.http2Log(
-          `tls established (inprocess) ALPN=${tlsSocket.alpnProtocol || "none"}`,
+        // TLS finished successfully. Diagnose AuthenticateAsClient can return OK
+        // even if the client never sends HTTP bytes.
+        log.success(
+          `[Proxy] CONNECT TLS-OK ${label} ALPN=${tlsSocket.alpnProtocol || "none"}`,
         );
-        // Lazy HTTP/2|HTTP/1 attach on first app data (see comment above).
         tlsSocket.once("data", (chunk) => {
-          handoffToHttp2(chunk);
+          handoff(chunk);
         });
       });
 
@@ -949,11 +1030,6 @@ function attachConnectSocketToLocalSecureResponder(clientSocket, head, label) {
 
   try {
     clientSocket.write(established, () => {
-      try {
-        clientSocket.resume();
-      } catch {
-        // ignore
-      }
       beginTls();
     });
   } catch (err) {
