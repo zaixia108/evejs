@@ -1,0 +1,16 @@
+[project]
+name = "evejs-v0-12-2"
+version = "0.1.0"
+description = "EveJS multiplayer client launcher (customtkinter)"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "customtkinter>=6.0.0",
+    "pyinstaller>=6.21.0",
+]
+
+[project.scripts]
+evejs-client = "evejs_client.app:run_app"
+
+[tool.hatch.build.targets.wheel]
+packages = ["evejs_client"]

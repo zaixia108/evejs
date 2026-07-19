@@ -45,3 +45,5 @@ server/tidi_probe.log
 _local
 .idea
 .jbeval
+dist
+build
