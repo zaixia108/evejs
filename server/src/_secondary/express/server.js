@@ -3,6 +3,7 @@ const path = require("path");
 const http = require("http");
 const https = require("https");
 const net = require("net");
+const tls = require("tls");
 const http2 = require("http2");
 const crypto = require("crypto");
 
@@ -546,6 +547,13 @@ function blockHttpProxyRequest(req, res, targetUrl) {
   res.end();
 }
 
+function extractFirstPemCertificate(pemBundle) {
+  const match = String(pemBundle || "").match(
+    /-----BEGIN CERTIFICATE-----[\s\S]*?-----END CERTIFICATE-----/,
+  );
+  return match ? `${match[0].trim()}\n` : String(pemBundle || "");
+}
+
 function loadLocalTlsOptions() {
   const certDir = path.join(__dirname, "./certs");
   const certificateResult = ensureLocalLeafCertificate({ certDir });
@@ -560,14 +568,19 @@ function loadLocalTlsOptions() {
   }
 
   if (fs.existsSync(gatewayLeafCertPath) && fs.existsSync(gatewayLeafKeyPath)) {
+    // Present LEAF only. Files often append the EveJS CA for distribution;
+    // some TLS clients (SChannel / Diagnose) abort mid-handshake when that
+    // self-signed CA is also sent as an intermediate over CONNECT/FRP.
+    const fullPem = fs.readFileSync(gatewayLeafCertPath, "utf8");
+    const leafPem = extractFirstPemCertificate(fullPem);
     return {
       tlsOptions: {
         key: fs.readFileSync(gatewayLeafKeyPath),
-        cert: fs.readFileSync(gatewayLeafCertPath),
+        cert: leafPem,
         allowHTTP1: true,
         ALPNProtocols: ["h2", "http/1.1"],
       },
-      certPem: fs.readFileSync(gatewayLeafCertPath),
+      certPem: leafPem,
     };
   }
 
@@ -799,20 +812,25 @@ function createLocalSecureResponder(httpsPort, bindHost) {
 
   localSecureResponderServer = secureServer;
   secureServer.listen(httpsPort, bindHost, () => {
-    log.debug(`local https responder listening on ${bindHost}:${httpsPort}`);
+    log.success(
+      `[Proxy] local public-gateway TLS ready on ${bindHost}:${httpsPort} ` +
+        `(CONNECT path=LOCAL-INPROCESS-TLS, intercept=${shouldHandleInterceptLocally()})`,
+    );
   });
 }
 
 /**
- * Terminate public-gateway TLS on the CONNECT client socket itself by feeding
- * it into the existing Http2SecureServer. Avoids net.connect(loopback:httpsPort)
- * which can RST the handshake for some WAN/FRP clients even when CONNECT 200 OK.
+ * Terminate public-gateway TLS on the CONNECT client socket itself.
+ * Prefer explicit TLSSocket + handoff to the Http2SecureServer (more reliable
+ * than emit("connection") on sockets that already passed through http.Server
+ * CONNECT parsing, especially under FRP).
  */
 function attachConnectSocketToLocalSecureResponder(clientSocket, head, label) {
   if (!localSecureResponderServer) {
     return false;
   }
 
+  const { tlsOptions } = loadLocalTlsOptions();
   const established =
     "HTTP/1.1 200 Connection Established\r\n" +
     "Proxy-Agent: EveJS Elysian\r\n" +
@@ -829,9 +847,40 @@ function attachConnectSocketToLocalSecureResponder(clientSocket, head, label) {
       } catch {
         // ignore
       }
-      // tls.Server connection listener starts the server-side TLS handshake.
-      localSecureResponderServer.emit("connection", clientSocket);
-      log.proxy(`CONNECT ${label} -> LOCAL-INPROCESS tls`);
+
+      const tlsSocket = new tls.TLSSocket(clientSocket, {
+        isServer: true,
+        key: tlsOptions.key,
+        cert: tlsOptions.cert,
+        ALPNProtocols: tlsOptions.ALPNProtocols || ["h2", "http/1.1"],
+        handshakeTimeout: 30_000,
+        rejectUnauthorized: false,
+      });
+
+      tlsSocket.on("error", (err) => {
+        log.http2Err(
+          `inprocess TLSSocket error: ${err.message} code=${err.code || "n/a"}`,
+        );
+      });
+
+      tlsSocket.once("secure", () => {
+        log.http2Log(
+          `tls established (inprocess) ALPN=${tlsSocket.alpnProtocol || "none"}`,
+        );
+        try {
+          // Hand the already-secured socket to the HTTP/2 server stack.
+          localSecureResponderServer.emit("secureConnection", tlsSocket);
+        } catch (err) {
+          log.http2Err(`secureConnection handoff failed: ${err.message}`);
+          try {
+            tlsSocket.destroy();
+          } catch {
+            // ignore
+          }
+        }
+      });
+
+      log.proxy(`CONNECT ${label} -> LOCAL-INPROCESS-TLS`);
     } catch (err) {
       log.proxyErr(
         `in-process TLS attach failed for ${label}: ${err.message}`,
@@ -845,7 +894,6 @@ function attachConnectSocketToLocalSecureResponder(clientSocket, head, label) {
   };
 
   try {
-    // If the socket was paused by the CONNECT setup path, resume after 200.
     clientSocket.write(established, () => {
       try {
         clientSocket.resume();
