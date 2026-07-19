@@ -570,7 +570,9 @@ function loadLocalTlsOptions() {
   const certPath = path.join(certDir, "gateway-dev-cert.pem");
 
   if (certificateResult.rebuilt) {
-    log.debug("rebuilt local public-gateway TLS certificate");
+    log.success(
+      "[Proxy] rebuilt local public-gateway TLS certificate (SChannel-friendly generation)",
+    );
   }
 
   if (fs.existsSync(gatewayLeafCertPath) && fs.existsSync(gatewayLeafKeyPath)) {
@@ -885,16 +887,13 @@ function ensureConnectMitmHttpsServer() {
     return connectMitmHttpsServer;
   }
   const { tlsOptions } = loadLocalTlsOptions();
-  // TLS1.2-only: SChannel/Diagnose through FRP is more reliable than TLS1.3 here.
-  // (Node loopback self-test can do TLS1.3; remote SslStream often aborts mid-flight.)
   connectMitmHttpsServer = https.createServer(
     {
       key: tlsOptions.key,
       cert: tlsOptions.cert,
       minVersion: "TLSv1.2",
-      maxVersion: "TLSv1.2",
-      // Diagnose.ps1 / SslStream: HTTP/1.1 only (no h2 preface).
-      ALPNProtocols: ["http/1.1"],
+      // No ALPN restriction — some SChannel builds choke if only http/1.1 is offered.
+      // Request handler is plain HTTP/1.1 either way.
     },
     handleConnectMitmHttpRequest,
   );
@@ -904,7 +903,6 @@ function ensureConnectMitmHttpsServer() {
         `proto=${tlsSocket.getProtocol && tlsSocket.getProtocol()} ` +
         `(LOCAL-MITM-HTTPS)`,
     );
-    // Mark so hang-ups after a successful handshake (Diagnose dispose) are quieter.
     try {
       tlsSocket.__evejsMitmHandshakeOk = true;
     } catch {
@@ -926,24 +924,24 @@ function ensureConnectMitmHttpsServer() {
     });
   });
   connectMitmHttpsServer.on("tlsClientError", (err, tlsSocket) => {
-    // Diagnose/game often close right after handshake without an HTTP request.
-    // That surfaces as socket hang up / ECONNRESET — not a cert failure.
     const msg = String((err && err.message) || err || "");
     const code = err && err.code;
+    const reason = err && err.reason;
     const handshakeOk = tlsSocket && tlsSocket.__evejsMitmHandshakeOk;
+    // Always surface pre-handshake failures (unknown ca, bad cert, protocol).
+    // Only quiet post-success hang-ups from Diagnose dispose.
     if (
-      handshakeOk ||
-      code === "ECONNRESET" ||
-      /hang up|ECONNRESET|ECONNABORTED/i.test(msg)
+      handshakeOk &&
+      (code === "ECONNRESET" || /hang up|ECONNRESET|ECONNABORTED/i.test(msg))
     ) {
       log.debug(
-        `connect-mitm tls client close: ${msg} code=${code || "n/a"}` +
-          (handshakeOk ? " (after TLS-OK)" : ""),
+        `connect-mitm tls client close after TLS-OK: ${msg} code=${code || "n/a"}`,
       );
       return;
     }
     log.http2Err(
-      `connect-mitm tls client error: ${msg} code=${code || "n/a"}`,
+      `connect-mitm tls client error: ${msg} code=${code || "n/a"}` +
+        ` reason=${reason || "n/a"} library=${(err && err.library) || "n/a"}`,
     );
   });
   connectMitmHttpsServer.on("error", (err) => {
@@ -1095,9 +1093,65 @@ function attachConnectViaMitmHttpsTunnel(clientSocket, head, label) {
 
       log.proxy(`CONNECT ${label} -> LOCAL-MITM-HTTPS 127.0.0.1:${mitmPort}`);
 
-      wireTunnel(clientSocket, upstream, head, tunnelLabel, {
-        idleTimeoutMs: INTERCEPT_PROXY_TUNNEL_IDLE_TIMEOUT_MS,
+      // Classic bidirectional pipe — simplest splice for TLS-over-CONNECT.
+      try {
+        clientSocket.setNoDelay(true);
+        upstream.setNoDelay(true);
+        clientSocket.setTimeout(0);
+        upstream.setTimeout(0);
+      } catch {
+        // ignore
+      }
+
+      let upBytes = 0;
+      let downBytes = 0;
+      let closed = false;
+      const finish = (why) => {
+        if (closed) {
+          return;
+        }
+        closed = true;
+        log.proxy(
+          `tunnel closed ${tunnelLabel} ▲${upBytes}B ▼${downBytes}B${
+            why ? ` (${why})` : ""
+          }`,
+        );
+        try {
+          if (!clientSocket.destroyed) {
+            clientSocket.destroy();
+          }
+        } catch {
+          // ignore
+        }
+        try {
+          if (!upstream.destroyed) {
+            upstream.destroy();
+          }
+        } catch {
+          // ignore
+        }
+      };
+
+      if (head && head.length > 0) {
+        upstream.write(head);
+        upBytes += head.length;
+      }
+      clientSocket.on("data", (chunk) => {
+        upBytes += chunk.length;
+        if (!upstream.destroyed) {
+          upstream.write(chunk);
+        }
       });
+      upstream.on("data", (chunk) => {
+        downBytes += chunk.length;
+        if (!clientSocket.destroyed) {
+          clientSocket.write(chunk);
+        }
+      });
+      clientSocket.on("close", () => finish("client-close"));
+      upstream.on("close", () => finish("upstream-close"));
+      clientSocket.on("error", () => finish("client-error"));
+      upstream.on("error", () => finish("upstream-error"));
 
       try {
         clientSocket.resume();
@@ -1120,6 +1174,84 @@ function attachConnectViaMitmHttpsTunnel(clientSocket, head, label) {
   });
 
   return true;
+}
+
+/**
+ * After the public proxy is listening, CONNECT to ourselves then TLS.
+ * Proves MITM path works end-to-end with OpenSSL (not SChannel).
+ */
+function runFullPathConnectTlsSelfTest(httpPort, bindHost) {
+  const dialHost =
+    bindHost === "0.0.0.0" || bindHost === "::" || bindHost === "[::]"
+      ? "127.0.0.1"
+      : bindHost;
+  try {
+    const req = http.request({
+      host: dialHost,
+      port: httpPort,
+      method: "CONNECT",
+      path: "dev-public-gateway.evetech.net:443",
+      headers: {
+        Host: "dev-public-gateway.evetech.net:443",
+      },
+      timeout: 5000,
+    });
+    req.on("connect", (res, socket, head) => {
+      if (res.statusCode !== 200) {
+        log.http2Err(
+          `[Proxy] full-path CONNECT self-test bad status ${res.statusCode}`,
+        );
+        socket.destroy();
+        return;
+      }
+      if (head && head.length > 0) {
+        try {
+          socket.unshift(head);
+        } catch {
+          // ignore
+        }
+      }
+      const probe = tls.connect(
+        {
+          socket,
+          servername: "dev-public-gateway.evetech.net",
+          rejectUnauthorized: false,
+          minVersion: "TLSv1.2",
+        },
+        () => {
+          log.success(
+            `[Proxy] full-path CONNECT+TLS self-test OK ` +
+              `ALPN=${probe.alpnProtocol || "none"} ` +
+              `proto=${probe.getProtocol && probe.getProtocol()}`,
+          );
+          probe.end();
+          try {
+            socket.destroy();
+          } catch {
+            // ignore
+          }
+        },
+      );
+      probe.on("error", (err) => {
+        log.http2Err(
+          `[Proxy] full-path CONNECT+TLS self-test FAIL: ${err.message}`,
+        );
+      });
+    });
+    req.on("error", (err) => {
+      log.http2Err(
+        `[Proxy] full-path CONNECT self-test dial FAIL: ${err.message}`,
+      );
+    });
+    req.on("timeout", () => {
+      req.destroy(new Error("timeout"));
+    });
+    req.end();
+  } catch (err) {
+    log.http2Err(
+      `[Proxy] full-path CONNECT self-test setup FAIL: ${err.message}`,
+    );
+  }
 }
 
 function wireTunnel(clientSocket, upstreamSocket, head, label, options = {}) {
@@ -1609,7 +1741,24 @@ function startServer() {
     log.proxyErr(`server error: ${err.message}`);
   });
 
-  proxyServer.listen(httpPort, bindHost);
+  proxyServer.listen(httpPort, bindHost, () => {
+    log.success(
+      `[Proxy] express listening on ${bindHost}:${httpPort} ` +
+        `(intercept=${shouldHandleInterceptLocally()})`,
+    );
+    if (shouldHandleInterceptLocally()) {
+      // MITM may still be binding; slight delay then full-path probe.
+      setTimeout(() => {
+        ensureConnectMitmHttpsServerAsync()
+          .then(() => runFullPathConnectTlsSelfTest(httpPort, bindHost))
+          .catch((err) => {
+            log.http2Err(
+              `[Proxy] MITM not ready for full-path self-test: ${err.message}`,
+            );
+          });
+      }, 250);
+    }
+  });
 
   log.debug(
     `express proxy mode: ${

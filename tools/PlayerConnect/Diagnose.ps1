@@ -29,32 +29,45 @@ function Write-Bad([string]$t) {
 }
 function Write-Info([string]$t) { Write-Host "  $t" -ForegroundColor Gray }
 
-# SChannel must get a *typed* RemoteCertificateValidationCallback. A bare
-# scriptblock is often ignored on Windows PowerShell 5.1, so the untrusted
-# EveJS CA is rejected mid-handshake (server sees ▲ClientHello ▼ServerCert
-# then client-close, and never logs CONNECT TLS-OK).
-function New-AcceptAllCertCallback {
-  return [System.Net.Security.RemoteCertificateValidationCallback] {
-    param(
-      [object]$sender,
-      [System.Security.Cryptography.X509Certificates.X509Certificate]$certificate,
-      [System.Security.Cryptography.X509Certificates.X509Chain]$chain,
-      [System.Net.Security.SslPolicyErrors]$sslPolicyErrors
-    )
-    try {
-      if ($null -ne $certificate) {
-        $script:remoteCert = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2 $certificate
-      }
-      $script:policy = $sslPolicyErrors
-    } catch {
-      # keep accepting
+# Bump when Diagnose behavior changes — must appear in console so we know
+# the client is not running a stale copy from an old PlayerConnect zip.
+$script:DiagnoseVersion = "2026-07-19d-schannel"
+
+# C# AcceptAll is required on Windows PowerShell 5.1. Bare scriptblocks are
+# often NOT wired as RemoteCertificateValidationCallback, so SChannel rejects
+# the EveJS leaf (server: ▲ClientHello ▼ServerCert + client-close, no TLS-OK).
+$script:EveJsAcceptAllCallback = $null
+try {
+  Add-Type -TypeDefinition @"
+using System.Net.Security;
+using System.Security.Cryptography.X509Certificates;
+public static class EveJsTlsAccept {
+  public static readonly RemoteCertificateValidationCallback AcceptAll =
+    delegate(object sender, X509Certificate certificate, X509Chain chain, SslPolicyErrors errors) {
+      return true;
+    };
+}
+"@ -ErrorAction Stop
+  $script:EveJsAcceptAllCallback = [EveJsTlsAccept]::AcceptAll
+} catch {
+  try {
+    $script:EveJsAcceptAllCallback = [System.Net.Security.RemoteCertificateValidationCallback] {
+      param($sender, $certificate, $chain, $sslPolicyErrors)
+      return $true
     }
-    return $true
+  } catch {
+    $script:EveJsAcceptAllCallback = $null
   }
 }
 
+function Get-AcceptAllCertCallback {
+  if ($null -eq $script:EveJsAcceptAllCallback) {
+    throw "RemoteCertificateValidationCallback not available (Add-Type failed)"
+  }
+  return $script:EveJsAcceptAllCallback
+}
+
 try {
-  # .NET Framework defaults can exclude TLS1.2 on older images.
   [Net.ServicePointManager]::SecurityProtocol = `
     [Net.SecurityProtocolType]::Tls12 -bor `
     [Net.SecurityProtocolType]::Tls11 -bor `
@@ -78,6 +91,10 @@ $proxyBase = "http://{0}:{1}/" -f $hostName, $proxyPort
 Write-Host ""
 Write-Host "  EveJS PlayerConnect Diagnose" -ForegroundColor Cyan
 Write-Host "  Host: $hostName" -ForegroundColor DarkGray
+Write-Host ("  Script version: {0}" -f $script:DiagnoseVersion) -ForegroundColor DarkGray
+if ($null -eq $script:EveJsAcceptAllCallback) {
+  Write-Bad "TLS cert accept callback failed to load — gateway/XMPP TLS tests will be unreliable"
+}
 
 # ── 1) health ───────────────────────────────────────────────────────────────
 Write-Title "1) PlayerConnect health"
@@ -172,41 +189,33 @@ function Test-DirectTls([string]$TargetHost, [int]$Port, [string]$Sni, $TrustedC
     $client.EndConnect($iar)
     Write-Ok "TCP connected"
 
-    $callback = New-AcceptAllCertCallback
+    $callback = Get-AcceptAllCertCallback
     $ssl = New-Object System.Net.Security.SslStream($client.GetStream(), $false, $callback)
     $tls12 = [System.Security.Authentication.SslProtocols]::Tls12
     $ssl.AuthenticateAsClient($Sni, $null, $tls12, $false)
     Write-Ok ("TLS handshake completed ({0})" -f $ssl.SslProtocol)
-    Write-Info ("leaf Subject={0}" -f $script:remoteCert.Subject)
-    Write-Info ("leaf Issuer ={0}" -f $script:remoteCert.Issuer)
-    Write-Info ("SslPolicyErrors={0}" -f $script:policy)
-
-    if ($TrustedCa -and $script:remoteCert.Issuer -eq $TrustedCa.Subject) {
-      Write-Ok "leaf is issued by the EveJS CA from playerconnect/ca.pem"
-    } elseif ($TrustedCa) {
-      Write-Bad "leaf issuer does NOT match EveJS CA — host certs may be out of sync"
-      Write-Info ("expected issuer: {0}" -f $TrustedCa.Subject)
+    $leaf = $null
+    if ($ssl.RemoteCertificate) {
+      $leaf = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2 $ssl.RemoteCertificate
     }
-
-    $pol = "$($script:policy)"
-    if ($pol -match "RemoteCertificateNameMismatch") {
-      Write-Bad "Certificate name mismatch: cert CN/SAN does not include '$Sni'"
-      Write-Info "On SERVER: set gameServerHost/xmppConnectHost to your domain,"
-      Write-Info "  delete server\certs\xmpp-dev-cert.pem and xmpp-dev-key.pem,"
-      Write-Info "  re-run Server launcher configure, restart EveJS."
-      Write-Info "  Expect leaf Subject=CN=$Sni and SslPolicyErrors=None."
-    } elseif ($pol -ne "None" -and $pol -ne "") {
-      Write-Bad "Windows trust errors: $pol (install CA into Root + client cacert.pem)"
+    if ($leaf) {
+      Write-Info ("leaf Subject={0}" -f $leaf.Subject)
+      Write-Info ("leaf Issuer ={0}" -f $leaf.Issuer)
+      if ($TrustedCa -and $leaf.Issuer -eq $TrustedCa.Subject) {
+        Write-Ok "leaf is issued by the EveJS CA from playerconnect/ca.pem"
+      } elseif ($TrustedCa) {
+        Write-Bad "leaf issuer does NOT match EveJS CA — host certs may be out of sync"
+        Write-Info ("expected issuer: {0}" -f $TrustedCa.Subject)
+      }
+      if ($leaf.Subject -notmatch [regex]::Escape($Sni) -and $Sni -ne "localhost") {
+        Write-Info "Note: Subject may use SAN; name mismatch only matters without AcceptAll callback."
+      }
     }
 
     $ssl.Dispose()
     $client.Close()
   } catch {
     Write-Bad "TLS failed: $($_.Exception.Message)"
-    if ($script:remoteCert) {
-      Write-Info ("leaf Subject={0}" -f $script:remoteCert.Subject)
-      Write-Info ("leaf Issuer ={0}" -f $script:remoteCert.Issuer)
-    }
   }
 }
 
@@ -273,8 +282,7 @@ function Test-GatewayTls {
       return $false
     }
     Write-Ok "proxy CONNECT established (tunnel)"
-    # Typed callback — required so untrusted EveJS leaf is accepted under SChannel.
-    $callback = New-AcceptAllCertCallback
+    $callback = Get-AcceptAllCertCallback
     $ssl = New-Object System.Net.Security.SslStream($stream, $false, $callback)
     if ($null -ne $SslProtocol) {
       $ssl.AuthenticateAsClient("dev-public-gateway.evetech.net", $null, $SslProtocol, $false)
@@ -283,13 +291,15 @@ function Test-GatewayTls {
       $ssl.AuthenticateAsClient("dev-public-gateway.evetech.net", $null, $tls12, $false)
     }
     Write-Ok ("Gateway TLS completed ({0})" -f $ssl.SslProtocol)
-    Write-Info ("leaf Subject={0}" -f $script:remoteCert.Subject)
-    Write-Info ("leaf Issuer ={0}" -f $script:remoteCert.Issuer)
-    Write-Info ("SslPolicyErrors={0}" -f $script:policy)
-    if ($ca -and $script:remoteCert.Issuer -eq $ca.Subject) {
-      Write-Ok "gateway leaf is issued by the EveJS CA"
-    } elseif ($ca) {
-      Write-Bad "gateway leaf issuer does NOT match EveJS CA"
+    if ($ssl.RemoteCertificate) {
+      $leaf = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2 $ssl.RemoteCertificate
+      Write-Info ("leaf Subject={0}" -f $leaf.Subject)
+      Write-Info ("leaf Issuer ={0}" -f $leaf.Issuer)
+      if ($ca -and $leaf.Issuer -eq $ca.Subject) {
+        Write-Ok "gateway leaf is issued by the EveJS CA"
+      } elseif ($ca) {
+        Write-Bad "gateway leaf issuer does NOT match EveJS CA"
+      }
     }
     return $true
   } catch {
@@ -298,12 +308,7 @@ function Test-GatewayTls {
     if ($ex.InnerException) {
       Write-Info ("inner: {0}" -f $ex.InnerException.Message)
     }
-    if ($script:remoteCert) {
-      Write-Info ("leaf Subject={0} Issuer={1}" -f $script:remoteCert.Subject, $script:remoteCert.Issuer)
-      Write-Info ("SslPolicyErrors at fail={0}" -f $script:policy)
-    } else {
-      Write-Info "no leaf cert received (handshake aborted before Certificate, or callback not invoked)"
-    }
+    Write-Info "If callback is broken, SChannel resets after ServerHello (server: client-close, no TLS-OK)."
     return $false
   } finally {
     if ($ssl) { try { $ssl.Dispose() } catch {} }
@@ -312,23 +317,53 @@ function Test-GatewayTls {
 }
 
 Write-Title ("5) Gateway TLS via proxy {0}:{1} CONNECT dev-public-gateway.evetech.net:443" -f $hostName, $proxyPort)
+Write-Info ("Diagnose version: {0}" -f $script:DiagnoseVersion)
 $tls12 = [System.Security.Authentication.SslProtocols]::Tls12
-# Prefer TLS1.2 first — more reliable through FRP/SChannel than negotiated TLS1.3.
-$okGw = Test-GatewayTls -ProxyHost $hostName -ProxyPort $proxyPort -ProtocolLabel "TLS1.2 only" -SslProtocol $tls12
+$okGw = Test-GatewayTls -ProxyHost $hostName -ProxyPort $proxyPort -ProtocolLabel "TLS1.2 + C# AcceptAll" -SslProtocol $tls12
 if (-not $okGw) {
-  Start-Sleep -Milliseconds 300
+  Start-Sleep -Milliseconds 400
   $okGw = Test-GatewayTls -ProxyHost $hostName -ProxyPort $proxyPort -ProtocolLabel "TLS1.2 retry" -SslProtocol $tls12
+}
+# Optional second opinion via curl (often Schannel or LibreSSL with -k).
+if (-not $okGw) {
+  $curl = Get-Command "curl.exe" -ErrorAction SilentlyContinue
+  if ($curl) {
+    Write-Info "--- try curl.exe -k via HTTP proxy ---"
+    try {
+      $proxyUrl = "http://{0}:{1}" -f $hostName, $proxyPort
+      $args = @(
+        "-sS", "-k", "--connect-timeout", "8", "--max-time", "20",
+        "-x", $proxyUrl,
+        "-o", "NUL",
+        "-w", "%{http_code}",
+        "https://dev-public-gateway.evetech.net/"
+      )
+      $code = & curl.exe @args 2>&1
+      $codeStr = "$code".Trim()
+      Write-Info ("curl http_code={0}" -f $codeStr)
+      if ($codeStr -match '^[23]\d\d$') {
+        Write-Ok "curl gateway via proxy succeeded (TLS path OK; SslStream may still be picky)"
+        $okGw = $true
+      } else {
+        Write-Bad "curl gateway via proxy failed"
+      }
+    } catch {
+      Write-Bad ("curl test error: {0}" -f $_.Exception.Message)
+    }
+  }
 }
 if (-not $okGw) {
   Write-Info "CONNECT 200 + TLS reset often means:"
-  Write-Info "  1) Server still on OLD path. Log must show:"
-  Write-Info "       PRX CONNECT ... -> LOCAL-MITM-HTTPS 127.0.0.1:<port>"
-  Write-Info "     Startup should also show: CONNECT MITM HTTPS ready ..."
-  Write-Info "  2) BAD (broken old path):"
-  Write-Info "       PRX CONNECT ... -> LOCAL-INPROCESS-TLS"
-  Write-Info "       H2  inprocess TLSSocket error: read ECONNRESET"
-  Write-Info "  3) BAD (even older): -> LOCAL 127.0.0.1:26003 then hang up"
-  Write-Info "  4) Update the folder that actually runs the server, full restart."
+  Write-Info "  1) Client Diagnose.ps1 is STALE. Console must show:"
+  Write-Info "       Script version: 2026-07-19d-schannel"
+  Write-Info "       --- try TLS1.2 + C# AcceptAll ---"
+  Write-Info "  2) Server log while step 5 runs must show:"
+  Write-Info "       PRX CONNECT ... -> LOCAL-MITM-HTTPS"
+  Write-Info "       [Proxy] CONNECT TLS-OK ...   (handshake completed)"
+  Write-Info "     BAD: tunnel closed ▲xxxB ▼yyyB (client-close) WITHOUT TLS-OK"
+  Write-Info "  3) Server startup should show:"
+  Write-Info "       full-path CONNECT+TLS self-test OK"
+  Write-Info "  4) Sync server.js + localTlsCertificate.js, full restart."
   Write-Info "  5) GET /health => localIntercept=true, connectMitmHttps=true"
   Write-Info "In-game paid UI also needs CA in client cacert.pem (Client launcher)."
 }

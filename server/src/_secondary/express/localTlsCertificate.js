@@ -21,6 +21,8 @@ const LOCAL_TLS_DNS_ALT_NAMES = Object.freeze([
   "localhost",
 ]);
 const LOCAL_TLS_IP_ALT_NAMES = Object.freeze(["127.0.0.1"]);
+/** Bump to force rebuild of gateway-dev-cert.pem on all hosts. */
+const GATEWAY_LEAF_CERT_GENERATION = "5-minimal-schannel";
 
 function ensureParentDirectory(filePath) {
   fs.mkdirSync(path.dirname(filePath), { recursive: true });
@@ -131,7 +133,8 @@ function buildLocalLeafCertificate(options) {
     },
   ]);
   cert.setIssuer(caCert.subject.attributes);
-  // Keep extensions SChannel-friendly (non-critical EKU; standard serverAuth).
+  // Minimal extensions — avoid forge AKI quirks that SChannel may reject
+  // before the RemoteCertificateValidationCallback runs.
   cert.setExtensions([
     {
       name: "basicConstraints",
@@ -156,10 +159,6 @@ function buildLocalLeafCertificate(options) {
     {
       name: "subjectKeyIdentifier",
     },
-    {
-      name: "authorityKeyIdentifier",
-      keyIdentifier: true,
-    },
   ]);
 
   cert.sign(caKey, forge.md.sha256.create());
@@ -176,6 +175,16 @@ function buildLocalLeafCertificate(options) {
     forge.pki.privateKeyToPem(keyPair.privateKey),
     "utf8",
   );
+  // Generation stamp so ensureLocalLeafCertificate can force rebuilds.
+  try {
+    fs.writeFileSync(
+      `${options.outCertPath}.gen`,
+      `${GATEWAY_LEAF_CERT_GENERATION}\n`,
+      "utf8",
+    );
+  } catch {
+    // ignore
+  }
 }
 
 function certificateAttributesEqual(left = [], right = []) {
@@ -248,22 +257,14 @@ function hasRequiredAltNames(certPem) {
   );
 }
 
-function leafHasSchannelFriendlyExtensions(certPem) {
+function gatewayLeafGenerationMatches(outCertPath) {
   try {
-    const firstPem =
-      String(certPem || "").match(
-        /-----BEGIN CERTIFICATE-----[\s\S]*?-----END CERTIFICATE-----/,
-      )?.[0] || certPem;
-    const cert = forge.pki.certificateFromPem(firstPem);
-    const eku = cert.getExtension("extKeyUsage");
-    // Older leaves marked EKU critical — SChannel can abort mid-handshake.
-    if (eku && eku.critical) {
+    const stampPath = `${outCertPath}.gen`;
+    if (!fs.existsSync(stampPath)) {
       return false;
     }
-    if (!cert.getExtension("authorityKeyIdentifier")) {
-      return false;
-    }
-    return true;
+    const stamp = fs.readFileSync(stampPath, "utf8").trim();
+    return stamp === GATEWAY_LEAF_CERT_GENERATION;
   } catch {
     return false;
   }
@@ -289,7 +290,7 @@ function ensureLocalLeafCertificate(options = {}) {
     fs.existsSync(outKeyPath) &&
     hasRequiredAltNames(existingCertPem) &&
     isIssuedByCertificateAuthority(existingCertPem, caCertPath) &&
-    leafHasSchannelFriendlyExtensions(existingCertPem)
+    gatewayLeafGenerationMatches(outCertPath)
   ) {
     return {
       outCertPath,
