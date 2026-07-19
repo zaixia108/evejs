@@ -31,7 +31,7 @@ function Write-Info([string]$t) { Write-Host "  $t" -ForegroundColor Gray }
 
 # Bump when Diagnose behavior changes — must appear in console so we know
 # the client is not running a stale copy from an old PlayerConnect zip.
-$script:DiagnoseVersion = "2026-07-19f-probejs"
+$script:DiagnoseVersion = "2026-07-19g-frpmux"
 
 # C# AcceptAll is required on Windows PowerShell 5.1. Bare scriptblocks are
 # often NOT wired as RemoteCertificateValidationCallback, so SChannel rejects
@@ -385,15 +385,16 @@ if (-not $okGw) {
   }
 }
 if (-not $okGw) {
-  Write-Info "CONNECT 200 + TLS reset often means:"
-  Write-Info "  1) Client Diagnose version must be: 2026-07-19f-probejs"
-  Write-Info "  2) Server log during step 5 should show ONE of:"
-  Write-Info "       CONNECT ... -> LOCAL-WRAP-TLS   then  CONNECT TLS-OK ... (LOCAL-WRAP-TLS)"
-  Write-Info "       CONNECT ... -> LOCAL-MITM-HTTPS then  CONNECT TLS-OK ... (LOCAL-MITM-HTTPS)"
-  Write-Info "  3) If Node probe also fails: FRP must be type=tcp for 26002 (not http),"
-  Write-Info "     and server must run latest server.js (full restart)."
-  Write-Info "  4) Startup should log: full-path CONNECT+TLS self-test OK"
-  Write-Info "  5) GET /health => localIntercept=true, connectMitmHttps=true"
+  Write-Info "CONNECT 200 + TLS reset (Node also ECONNRESET) almost always means:"
+  Write-Info "  A) FRP tcpMux is ON — HTTP works, TLS-after-CONNECT dies."
+  Write-Info "     On GAME HOST frpc.toml AND VPS frps.toml set:"
+  Write-Info "       transport.tcpMux = false"
+  Write-Info "     Then restart frps (VPS) and frpc (game host)."
+  Write-Info "  B) Confirm on the GAME HOST itself:"
+  Write-Info "       node Probe-GatewayTls.js 127.0.0.1 26002     -> should OK"
+  Write-Info "       node Probe-GatewayTls.js <publicIP> 26002   -> if FAIL = FRP path"
+  Write-Info "  C) Server log for remote CONNECT must show TLS-OK (not only LOCAL-WRAP-TLS)."
+  Write-Info "  D) Diagnose version: 2026-07-19g-frpmux; copy Probe-GatewayTls.js too."
   Write-Info "In-game paid UI also needs CA in client cacert.pem (Client launcher)."
 }
 
