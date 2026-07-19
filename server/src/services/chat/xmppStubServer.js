@@ -59,34 +59,52 @@ function ensureTranscriptDir() {
 }
 
 function readTlsCredentials() {
-  if (!fs.existsSync(certPath) || !fs.existsSync(keyPath)) {
-    // Self-heal on a fresh checkout: generate a CA-signed XMPP TLS cert (and the
-    // shared CA, if missing) instead of refusing to start. The generated CA is
-    // what PlayerConnect distributes to players.
+  // Always run ensure — rebuilds when xmppConnectHost / gameServerHost is a
+  // domain (or new IP) that the existing cert does not cover (common after
+  // switching from LAN IP to DDNS/FRP hostname).
+  try {
+    const {
+      ensureXmppTlsCertificate,
+    } = require("../../_secondary/express/localTlsCertificate");
+    let commonName = "localhost";
+    const extraHosts = [];
     try {
-      const {
-        ensureXmppTlsCertificate,
-      } = require("../../_secondary/express/localTlsCertificate");
-      let commonName = "localhost";
-      try {
-        const { getXmppConnectHost } = require("./xmppConfig");
-        commonName = getXmppConnectHost() || "localhost";
-      } catch (hostError) {
-        commonName = "localhost";
+      const { getXmppConnectHost } = require("./xmppConfig");
+      commonName = getXmppConnectHost() || "localhost";
+    } catch (hostError) {
+      commonName = "localhost";
+    }
+    try {
+      const runtimeConfig = config;
+      if (runtimeConfig && runtimeConfig.gameServerHost) {
+        extraHosts.push(String(runtimeConfig.gameServerHost));
       }
-      ensureXmppTlsCertificate({
-        outCertPath: certPath,
-        outKeyPath: keyPath,
-        commonName,
-      });
+      if (runtimeConfig && runtimeConfig.xmppConnectHost) {
+        extraHosts.push(String(runtimeConfig.xmppConnectHost));
+      }
+    } catch (configError) {
+      // ignore
+    }
+    const result = ensureXmppTlsCertificate({
+      outCertPath: certPath,
+      outKeyPath: keyPath,
+      commonName,
+      extraHosts,
+    });
+    if (result.rebuilt) {
       log.info(
-        `[XMPP] Generated a self-signed TLS certificate at ${certDir} (first run).`,
+        `[XMPP] (Re)built chat TLS certificate for host=${commonName} at ${certDir}`,
       );
-    } catch (error) {
+    }
+  } catch (error) {
+    if (!fs.existsSync(certPath) || !fs.existsSync(keyPath)) {
       throw new Error(
         `Missing XMPP TLS certificate files at ${certDir} and auto-generation failed: ${error.message}`,
       );
     }
+    log.warn(
+      `[XMPP] Certificate ensure failed, using existing files: ${error.message}`,
+    );
   }
 
   return {

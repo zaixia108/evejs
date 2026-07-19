@@ -14,6 +14,9 @@ const {
 
 let gatewayStreamHandler = null;
 let mapTagsCdnAssetResolver = null;
+// Shared HTTPS/h2 responder used both on loopback :port+1 and for in-process
+// CONNECT intercept (FRP-safe: no second hop after the outer proxy socket).
+let localSecureResponderServer = null;
 
 function getGatewayStreamHandler() {
   if (!gatewayStreamHandler) {
@@ -654,9 +657,21 @@ function createLocalSecureResponder(httpsPort, bindHost) {
     log.http2Err(`cert parse error: ${err.message}`);
   }
 
-  const secureServer = http2.createSecureServer(tlsOptions);
+  // allowHTTP1 is set in tlsOptions so non-h2 clients (Diagnose SslStream, etc.)
+  // can complete the handshake; EVE still negotiates h2 via ALPN when available.
+  const secureServer = http2.createSecureServer({
+    ...tlsOptions,
+    allowHTTP1: true,
+    // Slightly more tolerant of high-latency paths (FRP / WAN).
+    handshakeTimeout: 30_000,
+  });
 
   secureServer.on("connection", (socket) => {
+    try {
+      socket.setNoDelay(true);
+    } catch {
+      // ignore
+    }
     log.http2Log(`tcp connect ${socket.remoteAddress}:${socket.remotePort}`);
   });
 
@@ -763,26 +778,99 @@ function createLocalSecureResponder(httpsPort, bindHost) {
     log.http2Err(`session error: ${err.message}`);
   });
 
-  secureServer.on("tlsClientError", (err) => {
-    log.http2Err(`tls client error: ${err.message} code=${err.code || "n/a"}`);
+  secureServer.on("tlsClientError", (err, tlsSocket) => {
+    log.http2Err(
+      `tls client error: ${err.message} code=${err.code || "n/a"} ` +
+        `reason=${err.reason || "n/a"} remote=${
+          tlsSocket && tlsSocket.remoteAddress
+            ? `${tlsSocket.remoteAddress}:${tlsSocket.remotePort || "?"}`
+            : "n/a"
+        }`,
+    );
   });
 
   secureServer.on("error", (err) => {
     log.http2Err(`server error: ${err.message}`);
   });
 
+  localSecureResponderServer = secureServer;
   secureServer.listen(httpsPort, bindHost, () => {
     log.debug(`local https responder listening on ${bindHost}:${httpsPort}`);
   });
 }
 
+/**
+ * Terminate public-gateway TLS on the CONNECT client socket itself by feeding
+ * it into the existing Http2SecureServer. Avoids net.connect(loopback:httpsPort)
+ * which can RST the handshake for some WAN/FRP clients even when CONNECT 200 OK.
+ */
+function attachConnectSocketToLocalSecureResponder(clientSocket, head, label) {
+  if (!localSecureResponderServer) {
+    return false;
+  }
+
+  const established =
+    "HTTP/1.1 200 Connection Established\r\n" +
+    "Proxy-Agent: EveJS Elysian\r\n" +
+    "\r\n";
+
+  const beginTls = () => {
+    try {
+      if (head && head.length > 0) {
+        clientSocket.unshift(head);
+      }
+      try {
+        clientSocket.setNoDelay(true);
+        clientSocket.setKeepAlive(true, SOCKET_KEEPALIVE_INITIAL_DELAY_MS);
+      } catch {
+        // ignore
+      }
+      // tls.Server connection listener starts the server-side TLS handshake.
+      localSecureResponderServer.emit("connection", clientSocket);
+      log.proxy(`CONNECT ${label} -> LOCAL-INPROCESS tls`);
+    } catch (err) {
+      log.proxyErr(
+        `in-process TLS attach failed for ${label}: ${err.message}`,
+      );
+      try {
+        clientSocket.destroy();
+      } catch {
+        // ignore
+      }
+    }
+  };
+
+  try {
+    // If the socket was paused by the CONNECT setup path, resume after 200.
+    clientSocket.write(established, () => {
+      try {
+        clientSocket.resume();
+      } catch {
+        // ignore
+      }
+      beginTls();
+    });
+  } catch (err) {
+    log.proxyErr(`CONNECT 200 write failed for ${label}: ${err.message}`);
+    try {
+      clientSocket.destroy();
+    } catch {
+      // ignore
+    }
+  }
+  return true;
+}
+
 function wireTunnel(clientSocket, upstreamSocket, head, label, options = {}) {
   let upBytes = 0;
   let downBytes = 0;
+  let closed = false;
   const idleTimeoutMs = Number.isFinite(options.idleTimeoutMs)
     ? options.idleTimeoutMs
     : DEFAULT_PROXY_TUNNEL_IDLE_TIMEOUT_MS;
 
+  // Critical for TLS-over-CONNECT (public-gateway) especially through FRP:
+  // disable Nagle so ClientHello / ServerHello are not delayed or coalesced badly.
   clientSocket.setNoDelay(true);
   clientSocket.setKeepAlive(true, SOCKET_KEEPALIVE_INITIAL_DELAY_MS);
   clientSocket.setTimeout(0);
@@ -790,42 +878,82 @@ function wireTunnel(clientSocket, upstreamSocket, head, label, options = {}) {
   upstreamSocket.setKeepAlive(true, SOCKET_KEEPALIVE_INITIAL_DELAY_MS);
   upstreamSocket.setTimeout(idleTimeoutMs > 0 ? idleTimeoutMs : 0);
 
+  const finish = (why) => {
+    if (closed) {
+      return;
+    }
+    closed = true;
+    log.proxy(`tunnel closed ${label} ▲${upBytes}B ▼${downBytes}B${why ? ` (${why})` : ""}`);
+    if (!clientSocket.destroyed) {
+      clientSocket.destroy();
+    }
+    if (!upstreamSocket.destroyed) {
+      upstreamSocket.destroy();
+    }
+  };
+
   if (head && head.length > 0) {
     upstreamSocket.write(head);
     upBytes += head.length;
   }
 
+  // Manual forward instead of dual pipe+data-listeners (avoids rare stream races
+  // when ClientHello arrives immediately after the 200 Connection Established).
   clientSocket.on("data", (chunk) => {
     upBytes += chunk.length;
+    if (!upstreamSocket.destroyed) {
+      const ok = upstreamSocket.write(chunk);
+      if (!ok) {
+        clientSocket.pause();
+      }
+    }
   });
-
   upstreamSocket.on("data", (chunk) => {
     downBytes += chunk.length;
+    if (!clientSocket.destroyed) {
+      const ok = clientSocket.write(chunk);
+      if (!ok) {
+        upstreamSocket.pause();
+      }
+    }
   });
-
-  upstreamSocket.pipe(clientSocket);
-  clientSocket.pipe(upstreamSocket);
+  clientSocket.on("drain", () => {
+    if (!upstreamSocket.destroyed) {
+      upstreamSocket.resume();
+    }
+  });
+  upstreamSocket.on("drain", () => {
+    if (!clientSocket.destroyed) {
+      clientSocket.resume();
+    }
+  });
 
   if (idleTimeoutMs > 0) {
     upstreamSocket.on("timeout", () => {
       log.proxyErr(`tunnel timeout ${label} ▲${upBytes}B ▼${downBytes}B`);
-      upstreamSocket.destroy();
-      clientSocket.destroy();
+      finish("timeout");
     });
   }
 
-  upstreamSocket.on("close", () => {
-    log.proxy(`tunnel closed ${label} ▲${upBytes}B ▼${downBytes}B`);
-  });
-
+  upstreamSocket.on("close", () => finish("upstream-close"));
+  clientSocket.on("close", () => finish("client-close"));
   upstreamSocket.on("error", (err) => {
     log.proxyErr(`tunnel upstream error ${label} ${err.message}`);
-    clientSocket.destroy();
+    finish("upstream-error");
   });
-
   clientSocket.on("error", (err) => {
     log.proxyErr(`tunnel client error ${label} ${err.message}`);
-    upstreamSocket.destroy();
+    finish("client-error");
+  });
+  clientSocket.on("end", () => {
+    if (!upstreamSocket.destroyed) {
+      upstreamSocket.end();
+    }
+  });
+  upstreamSocket.on("end", () => {
+    if (!clientSocket.destroyed) {
+      clientSocket.end();
+    }
   });
 }
 
@@ -1113,6 +1241,17 @@ function startServer() {
       return;
     }
 
+    // Preferred path for public-gateway / LaunchDarkly: terminate TLS in-process
+    // on this CONNECT socket (works better through FRP than loopback re-connect).
+    if (interceptTarget && shouldHandleInterceptLocally()) {
+      if (
+        attachConnectSocketToLocalSecureResponder(clientSocket, head, targetRaw)
+      ) {
+        return;
+      }
+      // Fall through to loopback tunnel if secure responder is not ready yet.
+    }
+
     let connectHost = host;
     let connectPort = port;
     let modeLabel = "REMOTE";
@@ -1132,30 +1271,50 @@ function startServer() {
 
     log.proxy(`CONNECT ${targetRaw} -> ${modeLabel} ${connectHost}:${connectPort}`);
 
-    const upstreamSocket = net.connect(connectPort, connectHost, () => {
-      clientSocket.write(
-        "HTTP/1.1 200 Connection Established\r\n" +
-        "Proxy-Agent: EveJS Elysian\r\n" +
-        "\r\n",
-      );
+    // Pause until upstream is ready + 200 is fully flushed, so early TLS
+    // ClientHello bytes (common with aggressive clients / FRP) are not dropped.
+    try {
+      clientSocket.pause();
+    } catch {
+      // ignore
+    }
 
-      wireTunnel(
-        clientSocket,
-        upstreamSocket,
-        head,
-        `${targetRaw} via ${connectHost}:${connectPort}`,
-        {
-          idleTimeoutMs: interceptTarget
-            ? INTERCEPT_PROXY_TUNNEL_IDLE_TIMEOUT_MS
-            : DEFAULT_PROXY_TUNNEL_IDLE_TIMEOUT_MS,
-        },
-      );
-    });
+    const upstreamSocket = net.connect(
+      { port: connectPort, host: connectHost },
+      () => {
+        const established =
+          "HTTP/1.1 200 Connection Established\r\n" +
+          "Proxy-Agent: EveJS Elysian\r\n" +
+          "\r\n";
+        clientSocket.write(established, () => {
+          wireTunnel(
+            clientSocket,
+            upstreamSocket,
+            head,
+            `${targetRaw} via ${connectHost}:${connectPort}`,
+            {
+              idleTimeoutMs: interceptTarget
+                ? INTERCEPT_PROXY_TUNNEL_IDLE_TIMEOUT_MS
+                : DEFAULT_PROXY_TUNNEL_IDLE_TIMEOUT_MS,
+            },
+          );
+          try {
+            clientSocket.resume();
+          } catch {
+            // ignore
+          }
+        });
+      },
+    );
 
     upstreamSocket.on("error", (err) => {
       log.proxyErr(`connect failed ${connectHost}:${connectPort} ${err.message}`);
       if (!clientSocket.destroyed) {
-        clientSocket.write("HTTP/1.1 502 Bad Gateway\r\n\r\n");
+        try {
+          clientSocket.write("HTTP/1.1 502 Bad Gateway\r\n\r\n");
+        } catch {
+          // ignore
+        }
       }
       clientSocket.destroy();
     });

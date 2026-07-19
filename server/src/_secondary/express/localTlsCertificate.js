@@ -285,11 +285,47 @@ function ensureLocalLeafCertificate(options = {}) {
   };
 }
 
+function getCertificateIdentityHosts(certPem) {
+  const { dnsNames, ipAddresses } = parseSubjectAltNames(certPem);
+  try {
+    const cert = forge.pki.certificateFromPem(certPem);
+    const cnField = cert.subject.getField("CN");
+    const cn = cnField && cnField.value ? String(cnField.value).trim() : "";
+    if (cn) {
+      if (net.isIP(cn)) {
+        ipAddresses.add(cn);
+      } else {
+        dnsNames.add(cn.toLowerCase());
+      }
+    }
+  } catch {
+    // ignore
+  }
+  return { dnsNames, ipAddresses };
+}
+
+function certificateCoversHosts(certPem, requiredHosts = []) {
+  const { dnsNames, ipAddresses } = getCertificateIdentityHosts(certPem);
+  for (const raw of requiredHosts) {
+    const host = String(raw || "").trim();
+    if (!host) {
+      continue;
+    }
+    if (net.isIP(host)) {
+      if (!ipAddresses.has(host)) {
+        return false;
+      }
+    } else if (!dnsNames.has(host.toLowerCase())) {
+      return false;
+    }
+  }
+  return true;
+}
+
 // Ensure a CA-signed TLS cert for the XMPP chat server exists at the given
-// paths, creating the shared CA if needed. The EVE client validates the chat
-// TLS connection against its certifi CA bundle only and does NOT check the
-// hostname, so the SAN set is not critical (localhost + 127.0.0.1 by default,
-// plus any extraHosts). Lets a fresh checkout start instead of throwing.
+// paths, creating the shared CA if needed. Rebuilds when the configured
+// connect host (domain or IP) is missing from CN/SAN so DDNS/FRP domain
+// mode does not keep a stale LAN-IP certificate.
 function ensureXmppTlsCertificate(options = {}) {
   const outCertPath = options.outCertPath;
   const outKeyPath = options.outKeyPath;
@@ -298,16 +334,9 @@ function ensureXmppTlsCertificate(options = {}) {
   }
   const caCertPath = options.caCertPath || CA_CERT_PATH;
   const caKeyPath = options.caKeyPath || CA_KEY_PATH;
+  const forceRebuild = options.force === true;
 
   ensureCertificateAuthority({ caCertPath, caKeyPath });
-
-  if (
-    fs.existsSync(outCertPath) &&
-    fs.existsSync(outKeyPath) &&
-    isIssuedByCertificateAuthority(fs.readFileSync(outCertPath, "utf8"), caCertPath)
-  ) {
-    return { outCertPath, outKeyPath, rebuilt: false };
-  }
 
   const commonName = String(options.commonName || "localhost").trim() || "localhost";
   const dnsAltNames = [];
@@ -326,6 +355,21 @@ function ensureXmppTlsCertificate(options = {}) {
     }
   };
   [commonName, "localhost", "127.0.0.1", ...(options.extraHosts || [])].forEach(pushHost);
+  const requiredHosts = [...dnsAltNames, ...ipAltNames];
+
+  if (
+    !forceRebuild &&
+    fs.existsSync(outCertPath) &&
+    fs.existsSync(outKeyPath)
+  ) {
+    const existingPem = fs.readFileSync(outCertPath, "utf8");
+    if (
+      isIssuedByCertificateAuthority(existingPem, caCertPath) &&
+      certificateCoversHosts(existingPem, requiredHosts)
+    ) {
+      return { outCertPath, outKeyPath, rebuilt: false };
+    }
+  }
 
   const caCert = forge.pki.certificateFromPem(fs.readFileSync(caCertPath, "utf8"));
   const caPem = fs.readFileSync(caCertPath, "utf8").trim();
@@ -382,9 +426,11 @@ module.exports = {
   LOCAL_TLS_DNS_ALT_NAMES,
   LOCAL_TLS_IP_ALT_NAMES,
   buildLocalLeafCertificate,
+  certificateCoversHosts,
   ensureCertificateAuthority,
   ensureLocalLeafCertificate,
   ensureXmppTlsCertificate,
+  getCertificateIdentityHosts,
   hasRequiredAltNames,
   isIssuedByCertificateAuthority,
 };

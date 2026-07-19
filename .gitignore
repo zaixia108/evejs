@@ -37,7 +37,8 @@ server/tidi_probe.log
 *.sqlite
 *.sqlite-wal
 *.sqlite-shm
-/tools/PlayerConnect
+# PlayerConnect scripts are tracked (multiplayer host/client helpers).
+# /tools/PlayerConnect
 /tools/PlayerConnect-v2
 /tools/market-seederv2/cache/
 /tools/market-seederv2/target/
