@@ -816,14 +816,51 @@ function createLocalSecureResponder(httpsPort, bindHost) {
       `[Proxy] local public-gateway TLS ready on ${bindHost}:${httpsPort} ` +
         `(CONNECT path=LOCAL-INPROCESS-TLS, intercept=${shouldHandleInterceptLocally()})`,
     );
+    // Pure TLS self-test (no HTTP/2 preface). If this fails, certs/keys are bad.
+    try {
+      const probe = tls.connect(
+        {
+          host: localInterceptConnectHostForProbe(bindHost),
+          port: httpsPort,
+          servername: "dev-public-gateway.evetech.net",
+          rejectUnauthorized: false,
+          ALPNProtocols: ["http/1.1", "h2"],
+        },
+        () => {
+          log.success(
+            `[Proxy] self-test TLS handshake OK ALPN=${probe.alpnProtocol || "none"}`,
+          );
+          probe.end();
+        },
+      );
+      probe.setTimeout(5000, () => {
+        log.http2Err("[Proxy] self-test TLS timeout");
+        probe.destroy();
+      });
+      probe.on("error", (err) => {
+        log.http2Err(`[Proxy] self-test TLS FAIL: ${err.message}`);
+      });
+    } catch (err) {
+      log.http2Err(`[Proxy] self-test TLS setup FAIL: ${err.message}`);
+    }
   });
+}
+
+function localInterceptConnectHostForProbe(bindHost) {
+  return resolveLocalInterceptConnectHost(bindHost);
 }
 
 /**
  * Terminate public-gateway TLS on the CONNECT client socket itself.
- * Prefer explicit TLSSocket + handoff to the Http2SecureServer (more reliable
- * than emit("connection") on sockets that already passed through http.Server
- * CONNECT parsing, especially under FRP).
+ *
+ * Important: do NOT attach the Http2SecureServer session until the client
+ * sends the first application-data byte. Emitting secureConnection immediately
+ * makes Node wait for the HTTP/2 connection preface; Diagnose / some SslStream
+ * clients only complete the TLS handshake and send no preface, so the server
+ * RST mid-AuthenticateAsClient (CONNECT 200 OK, then "connection closed").
+ *
+ * EVE still works: after TLS it immediately sends h2 preface / requests, which
+ * triggers the lazy handoff below.
  */
 function attachConnectSocketToLocalSecureResponder(clientSocket, head, label) {
   if (!localSecureResponderServer) {
@@ -857,6 +894,30 @@ function attachConnectSocketToLocalSecureResponder(clientSocket, head, label) {
         rejectUnauthorized: false,
       });
 
+      let handedOff = false;
+      const handoffToHttp2 = (firstChunk) => {
+        if (handedOff) {
+          return;
+        }
+        handedOff = true;
+        try {
+          if (firstChunk && firstChunk.length) {
+            tlsSocket.unshift(firstChunk);
+          }
+          localSecureResponderServer.emit("secureConnection", tlsSocket);
+          log.http2Log(
+            `http handoff (inprocess) ALPN=${tlsSocket.alpnProtocol || "none"}`,
+          );
+        } catch (err) {
+          log.http2Err(`secureConnection handoff failed: ${err.message}`);
+          try {
+            tlsSocket.destroy();
+          } catch {
+            // ignore
+          }
+        }
+      };
+
       tlsSocket.on("error", (err) => {
         log.http2Err(
           `inprocess TLSSocket error: ${err.message} code=${err.code || "n/a"}`,
@@ -867,17 +928,10 @@ function attachConnectSocketToLocalSecureResponder(clientSocket, head, label) {
         log.http2Log(
           `tls established (inprocess) ALPN=${tlsSocket.alpnProtocol || "none"}`,
         );
-        try {
-          // Hand the already-secured socket to the HTTP/2 server stack.
-          localSecureResponderServer.emit("secureConnection", tlsSocket);
-        } catch (err) {
-          log.http2Err(`secureConnection handoff failed: ${err.message}`);
-          try {
-            tlsSocket.destroy();
-          } catch {
-            // ignore
-          }
-        }
+        // Lazy HTTP/2|HTTP/1 attach on first app data (see comment above).
+        tlsSocket.once("data", (chunk) => {
+          handoffToHttp2(chunk);
+        });
       });
 
       log.proxy(`CONNECT ${label} -> LOCAL-INPROCESS-TLS`);
