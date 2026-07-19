@@ -22,7 +22,7 @@ const LOCAL_TLS_DNS_ALT_NAMES = Object.freeze([
 ]);
 const LOCAL_TLS_IP_ALT_NAMES = Object.freeze(["127.0.0.1"]);
 /** Bump to force rebuild of gateway-dev-cert.pem on all hosts. */
-const GATEWAY_LEAF_CERT_GENERATION = "6-positive-serial-der";
+const GATEWAY_LEAF_CERT_GENERATION = "7-tls12-schannel";
 
 function ensureParentDirectory(filePath) {
   fs.mkdirSync(path.dirname(filePath), { recursive: true });

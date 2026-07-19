@@ -892,8 +892,7 @@ function ensureConnectMitmHttpsServer() {
       key: tlsOptions.key,
       cert: tlsOptions.cert,
       minVersion: "TLSv1.2",
-      // No ALPN restriction — some SChannel builds choke if only http/1.1 is offered.
-      // Request handler is plain HTTP/1.1 either way.
+      maxVersion: "TLSv1.2",
     },
     handleConnectMitmHttpRequest,
   );
@@ -983,8 +982,8 @@ function ensureConnectMitmHttpsServerAsync() {
               port: connectMitmPort,
               servername: "dev-public-gateway.evetech.net",
               rejectUnauthorized: false,
-              ALPNProtocols: ["http/1.1"],
               minVersion: "TLSv1.2",
+              maxVersion: "TLSv1.2",
             },
             () => {
               log.success(
@@ -1019,6 +1018,20 @@ function ensureConnectMitmHttpsServerAsync() {
  * Handshake completion is enough for Diagnose; HTTP/1.1 is handed to the
  * MITM https.Server request pipeline when the client sends application data.
  */
+/** Non-listening HTTP server used only to parse HTTP/1.1 after WRAP TLS. */
+let connectWrapHttpServer = null;
+
+function getConnectWrapHttpServer() {
+  if (!connectWrapHttpServer) {
+    // Plain http.Server: we feed it already-decrypted TLS sockets via 'connection'.
+    connectWrapHttpServer = http.createServer(handleConnectMitmHttpRequest);
+    connectWrapHttpServer.on("error", (err) => {
+      log.http2Err(`connect-wrap http server error: ${err.message}`);
+    });
+  }
+  return connectWrapHttpServer;
+}
+
 function attachConnectTlsWrap(clientSocket, head, label) {
   const { tlsOptions } = loadLocalTlsOptions();
 
@@ -1030,14 +1043,13 @@ function attachConnectTlsWrap(clientSocket, head, label) {
   try {
     clientSocket.setTimeout(0);
     clientSocket.setNoDelay(true);
+    clientSocket.setKeepAlive(true, 15_000);
   } catch {
     // ignore
   }
 
-  const established =
-    "HTTP/1.1 200 Connection Established\r\n" +
-    "Proxy-Agent: EveJS Elysian\r\n" +
-    "\r\n";
+  // Minimal CONNECT response — some clients/middleboxes dislike extra headers.
+  const established = "HTTP/1.1 200 Connection Established\r\n\r\n";
 
   clientSocket.write(established, (writeErr) => {
     if (writeErr) {
@@ -1050,107 +1062,116 @@ function attachConnectTlsWrap(clientSocket, head, label) {
       return;
     }
 
-    try {
-      // Detach any leftover HTTP-parser listeners from the CONNECT upgrade.
-      for (const ev of ["data", "readable", "end", "timeout"]) {
-        clientSocket.removeAllListeners(ev);
-      }
-    } catch {
-      // ignore
-    }
-
-    const chunks = [];
-    if (head && head.length > 0) {
-      chunks.push(Buffer.isBuffer(head) ? head : Buffer.from(head));
-    }
-    try {
-      clientSocket.resume();
-      let buffered;
-      while ((buffered = clientSocket.read()) !== null) {
-        chunks.push(buffered);
-      }
-    } catch {
-      // ignore
-    }
-    try {
-      clientSocket.pause();
-    } catch {
-      // ignore
-    }
-    if (chunks.length > 0) {
+    // Let the 200 flush through FRP before we start reading ClientHello as TLS.
+    setImmediate(() => {
       try {
-        clientSocket.unshift(Buffer.concat(chunks));
-      } catch (err) {
-        log.proxyErr(`CONNECT unshift failed ${label}: ${err.message}`);
-      }
-    }
-
-    let tlsSocket;
-    try {
-      const secureContext = tls.createSecureContext({
-        key: tlsOptions.key,
-        cert: tlsOptions.cert,
-        minVersion: "TLSv1.2",
-      });
-      tlsSocket = new tls.TLSSocket(clientSocket, {
-        isServer: true,
-        secureContext,
-        rejectUnauthorized: false,
-        handshakeTimeout: 30_000,
-      });
-    } catch (err) {
-      log.proxyErr(`CONNECT TLS wrap create failed ${label}: ${err.message}`);
-      try {
-        clientSocket.destroy();
-      } catch {
-        // ignore
-      }
-      return;
-    }
-
-    log.proxy(`CONNECT ${label} -> LOCAL-WRAP-TLS`);
-
-    tlsSocket.once("secure", () => {
-      log.success(
-        `[Proxy] CONNECT TLS-OK ${label} ALPN=${tlsSocket.alpnProtocol || "none"} ` +
-          `proto=${tlsSocket.getProtocol && tlsSocket.getProtocol()} ` +
-          `(LOCAL-WRAP-TLS)`,
-      );
-      try {
-        tlsSocket.__evejsMitmHandshakeOk = true;
-      } catch {
-        // ignore
-      }
-      // Attach HTTP/1.1 request pipeline (same handler as MITM listener).
-      try {
-        ensureConnectMitmHttpsServer();
-        if (connectMitmHttpsServer) {
-          connectMitmHttpsServer.emit("secureConnection", tlsSocket);
+        for (const ev of ["data", "readable", "end", "timeout"]) {
+          clientSocket.removeAllListeners(ev);
         }
-      } catch (err) {
-        log.http2Err(
-          `CONNECT WRAP HTTP handoff failed ${label}: ${err.message}`,
-        );
+      } catch {
+        // ignore
       }
-    });
 
-    tlsSocket.on("error", (err) => {
-      const msg = String((err && err.message) || err || "");
-      const code = err && err.code;
-      const reason = err && err.reason;
-      if (
-        tlsSocket.__evejsMitmHandshakeOk &&
-        /hang up|ECONNRESET|ECONNABORTED|EPIPE/i.test(msg)
-      ) {
-        log.debug(
-          `connect-wrap post-handshake close: ${msg} code=${code || "n/a"}`,
-        );
+      const chunks = [];
+      if (head && head.length > 0) {
+        chunks.push(Buffer.isBuffer(head) ? head : Buffer.from(head));
+      }
+      try {
+        clientSocket.resume();
+        let buffered;
+        while ((buffered = clientSocket.read()) !== null) {
+          chunks.push(buffered);
+        }
+      } catch {
+        // ignore
+      }
+      try {
+        clientSocket.pause();
+      } catch {
+        // ignore
+      }
+      if (chunks.length > 0) {
+        try {
+          clientSocket.unshift(Buffer.concat(chunks));
+        } catch (err) {
+          log.proxyErr(`CONNECT unshift failed ${label}: ${err.message}`);
+        }
+      }
+
+      let tlsSocket;
+      try {
+        // TLS1.2-only: SChannel + FRP is more reliable than TLS1.3 here.
+        const secureContext = tls.createSecureContext({
+          key: tlsOptions.key,
+          cert: tlsOptions.cert,
+          minVersion: "TLSv1.2",
+          maxVersion: "TLSv1.2",
+          ciphers:
+            "ECDHE-RSA-AES128-GCM-SHA256:ECDHE-RSA-AES256-GCM-SHA384:" +
+            "AES128-GCM-SHA256:AES256-GCM-SHA384:ECDHE-RSA-AES128-SHA256:" +
+            "ECDHE-RSA-AES128-SHA:AES128-SHA256:AES128-SHA",
+          honorCipherOrder: true,
+        });
+        tlsSocket = new tls.TLSSocket(clientSocket, {
+          isServer: true,
+          secureContext,
+          rejectUnauthorized: false,
+          handshakeTimeout: 30_000,
+        });
+      } catch (err) {
+        log.proxyErr(`CONNECT TLS wrap create failed ${label}: ${err.message}`);
+        try {
+          clientSocket.destroy();
+        } catch {
+          // ignore
+        }
         return;
       }
-      log.http2Err(
-        `connect-wrap tls error: ${msg} code=${code || "n/a"} ` +
-          `reason=${reason || "n/a"}`,
-      );
+
+      log.proxy(`CONNECT ${label} -> LOCAL-WRAP-TLS`);
+
+      tlsSocket.once("secure", () => {
+        log.success(
+          `[Proxy] CONNECT TLS-OK ${label} ALPN=${
+            tlsSocket.alpnProtocol || "none"
+          } ` +
+            `proto=${tlsSocket.getProtocol && tlsSocket.getProtocol()} ` +
+            `(LOCAL-WRAP-TLS)`,
+        );
+        try {
+          tlsSocket.__evejsMitmHandshakeOk = true;
+        } catch {
+          // ignore
+        }
+        // Feed decrypted socket into a plain HTTP/1.1 parser (not the TLS MITM
+        // listener — re-emitting secureConnection there double-logs and confuses).
+        try {
+          getConnectWrapHttpServer().emit("connection", tlsSocket);
+        } catch (err) {
+          log.http2Err(
+            `CONNECT WRAP HTTP handoff failed ${label}: ${err.message}`,
+          );
+        }
+      });
+
+      tlsSocket.on("error", (err) => {
+        const msg = String((err && err.message) || err || "");
+        const code = err && err.code;
+        const reason = err && err.reason;
+        if (
+          tlsSocket.__evejsMitmHandshakeOk &&
+          /hang up|ECONNRESET|ECONNABORTED|EPIPE/i.test(msg)
+        ) {
+          log.debug(
+            `connect-wrap post-handshake close: ${msg} code=${code || "n/a"}`,
+          );
+          return;
+        }
+        log.http2Err(
+          `connect-wrap tls error: ${msg} code=${code || "n/a"} ` +
+            `reason=${reason || "n/a"}`,
+        );
+      });
     });
   });
 
@@ -1360,6 +1381,7 @@ function runFullPathConnectTlsSelfTest(httpPort, bindHost) {
           servername: "dev-public-gateway.evetech.net",
           rejectUnauthorized: false,
           minVersion: "TLSv1.2",
+          maxVersion: "TLSv1.2",
         },
         () => {
           log.success(

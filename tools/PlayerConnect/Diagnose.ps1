@@ -31,7 +31,7 @@ function Write-Info([string]$t) { Write-Host "  $t" -ForegroundColor Gray }
 
 # Bump when Diagnose behavior changes — must appear in console so we know
 # the client is not running a stale copy from an old PlayerConnect zip.
-$script:DiagnoseVersion = "2026-07-19e-nodeprobe"
+$script:DiagnoseVersion = "2026-07-19f-probejs"
 
 # C# AcceptAll is required on Windows PowerShell 5.1. Bare scriptblocks are
 # often NOT wired as RemoteCertificateValidationCallback, so SChannel rejects
@@ -325,87 +325,33 @@ if (-not $okGw) {
   $okGw = Test-GatewayTls -ProxyHost $hostName -ProxyPort $proxyPort -ProtocolLabel "TLS1.2 retry" -SslProtocol $tls12
 }
 # Node OpenSSL probe — distinguishes FRP/tunnel breaks from SChannel-only issues.
+# IMPORTANT: process.argv[2]=host argv[3]=port (argv[1] is the script path!).
 if (-not $okGw) {
   $node = Get-Command "node" -ErrorAction SilentlyContinue
-  if ($node) {
+  $probeJs = Join-Path $BundleRoot "Probe-GatewayTls.js"
+  if ($node -and (Test-Path -LiteralPath $probeJs)) {
     Write-Info "--- try Node.js CONNECT+TLS (OpenSSL, rejectUnauthorized=false) ---"
-    $nodeScript = @'
-const http = require("http");
-const tls = require("tls");
-const host = process.argv[1];
-const port = Number(process.argv[2]);
-const req = http.request({
-  host,
-  port,
-  method: "CONNECT",
-  path: "dev-public-gateway.evetech.net:443",
-  headers: { Host: "dev-public-gateway.evetech.net:443" },
-  timeout: 10000,
-});
-req.on("connect", (res, socket, head) => {
-  if (res.statusCode !== 200) {
-    console.error("CONNECT_STATUS " + res.statusCode);
-    process.exit(2);
-  }
-  if (head && head.length) {
-    try { socket.unshift(head); } catch (_) {}
-  }
-  const s = tls.connect(
-    {
-      socket,
-      servername: "dev-public-gateway.evetech.net",
-      rejectUnauthorized: false,
-      minVersion: "TLSv1.2",
-    },
-    () => {
-      console.log("OK " + (s.getProtocol() || "?") + " " + (s.alpnProtocol || "none"));
-      try {
-        const c = s.getPeerCertificate();
-        if (c && c.subject) console.log("SUBJECT " + JSON.stringify(c.subject));
-        if (c && c.issuer) console.log("ISSUER " + JSON.stringify(c.issuer));
-      } catch (_) {}
-      s.end();
-      process.exit(0);
-    },
-  );
-  s.setTimeout(10000, () => {
-    console.error("TLS_TIMEOUT");
-    s.destroy();
-    process.exit(3);
-  });
-  s.on("error", (e) => {
-    console.error("TLS_ERR " + e.message);
-    process.exit(4);
-  });
-});
-req.on("timeout", () => {
-  console.error("CONNECT_TIMEOUT");
-  req.destroy();
-  process.exit(5);
-});
-req.on("error", (e) => {
-  console.error("REQ_ERR " + e.message);
-  process.exit(6);
-});
-req.end();
-'@
-    $tmpJs = Join-Path $env:TEMP ("evejs-gw-tls-{0}.js" -f [guid]::NewGuid().ToString("n"))
+    Write-Info ("probe: node `"{0}`" {1} {2}" -f $probeJs, $hostName, $proxyPort)
     try {
-      Set-Content -LiteralPath $tmpJs -Value $nodeScript -Encoding UTF8
-      $nodeOut = & node $tmpJs $hostName $proxyPort 2>&1
-      $nodeText = ($nodeOut | Out-String).Trim()
+      # Don't merge stderr into error records — capture as strings.
+      $prevEap = $ErrorActionPreference
+      $ErrorActionPreference = "Continue"
+      $nodeOut = & node $probeJs $hostName $proxyPort 2>&1 | ForEach-Object { "$_" }
+      $ErrorActionPreference = $prevEap
+      $nodeText = ($nodeOut -join "`n").Trim()
+      $nodeCode = $LASTEXITCODE
       Write-Info $nodeText
-      if ($LASTEXITCODE -eq 0 -and $nodeText -match '^OK ') {
+      if ($nodeCode -eq 0 -and $nodeText -match '(?m)^OK ') {
         Write-Ok "Node OpenSSL gateway TLS OK (tunnel fine; Windows SChannel/curl may still fail on cert)"
         $okGw = $true
       } else {
-        Write-Bad "Node OpenSSL gateway TLS failed — tunnel/FRP/server TLS path is broken (not just SChannel)"
+        Write-Bad ("Node OpenSSL gateway TLS failed (exit={0}) — tunnel/FRP/server path" -f $nodeCode)
       }
     } catch {
       Write-Bad ("Node probe error: {0}" -f $_.Exception.Message)
-    } finally {
-      try { Remove-Item -LiteralPath $tmpJs -Force -ErrorAction SilentlyContinue } catch {}
     }
+  } elseif ($node) {
+    Write-Bad "Probe-GatewayTls.js missing next to Diagnose.ps1 — copy it from tools/PlayerConnect/"
   } else {
     Write-Info "node not in PATH — skipped OpenSSL CONNECT probe"
   }
@@ -440,7 +386,7 @@ if (-not $okGw) {
 }
 if (-not $okGw) {
   Write-Info "CONNECT 200 + TLS reset often means:"
-  Write-Info "  1) Client Diagnose version must be: 2026-07-19e-nodeprobe"
+  Write-Info "  1) Client Diagnose version must be: 2026-07-19f-probejs"
   Write-Info "  2) Server log during step 5 should show ONE of:"
   Write-Info "       CONNECT ... -> LOCAL-WRAP-TLS   then  CONNECT TLS-OK ... (LOCAL-WRAP-TLS)"
   Write-Info "       CONNECT ... -> LOCAL-MITM-HTTPS then  CONNECT TLS-OK ... (LOCAL-MITM-HTTPS)"
