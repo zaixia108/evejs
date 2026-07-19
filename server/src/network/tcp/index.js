@@ -359,7 +359,16 @@ module.exports = function (serviceManager) {
           });
           sessionRegistry.unregister(clientSession);
         }
-        log.err(`[TCP] socket error: ${err.message}`);
+        // Diagnose / port probes connect then drop — ECONNRESET with no session is noise.
+        const msg = String((err && err.message) || err || "");
+        if (
+          !clientSession &&
+          (err.code === "ECONNRESET" || /ECONNRESET|hang up/i.test(msg))
+        ) {
+          log.debug(`[TCP] probe close: ${msg}`);
+          return;
+        }
+        log.err(`[TCP] socket error: ${msg}`);
       });
     })
     .listen(config.serverPort, config.gameServerBindHost, () => {

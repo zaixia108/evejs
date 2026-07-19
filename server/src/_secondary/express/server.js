@@ -1016,173 +1016,104 @@ function ensureConnectMitmHttpsServerAsync() {
 
 /**
  * Tunnel CONNECT through a clean loopback HTTPS (HTTP/1.1) listener.
- * Reply 200 first, buffer ClientHello until MITM TCP is up, then splice.
- * Does NOT wrap the http.Server CONNECT socket in tls.TLSSocket.
+ *
+ * Order matters for Node's HTTP CONNECT socket + remote SslStream:
+ *   1) pause client (Node may already have paused it)
+ *   2) dial MITM loopback
+ *   3) write "200 Connection Established" and wait for write callback
+ *   4) splice bytes (head + data) with wireTunnel
+ *   5) resume client
+ *
+ * The previous "200-first + early close handlers" path produced ▲0B ▼0B
+ * (client never reached TLS) under FRP/Diagnose.
  */
 function attachConnectViaMitmHttpsTunnel(clientSocket, head, label) {
   if (!connectMitmPort) {
     return false;
   }
 
-  const tunnelLabel = `${label} via MITM 127.0.0.1:${connectMitmPort}`;
-  let upBytes = 0;
-  let downBytes = 0;
-  let closed = false;
-  let upstreamReady = false;
-  /** @type {Buffer[]} */
-  const pendingFromClient = [];
-  if (head && head.length > 0) {
-    pendingFromClient.push(Buffer.from(head));
-    upBytes += head.length;
-  }
+  const mitmPort = connectMitmPort;
+  const tunnelLabel = `${label} via MITM 127.0.0.1:${mitmPort}`;
 
-  const finish = (why) => {
-    if (closed) {
-      return;
-    }
-    closed = true;
-    log.proxy(
-      `tunnel closed ${tunnelLabel} ▲${upBytes}B ▼${downBytes}B${
-        why ? ` (${why})` : ""
-      }`,
-    );
-    try {
-      if (!clientSocket.destroyed) {
-        clientSocket.destroy();
-      }
-    } catch {
-      // ignore
-    }
-    try {
-      if (upstream && !upstream.destroyed) {
-        upstream.destroy();
-      }
-    } catch {
-      // ignore
-    }
-  };
-
-  // 200 first so remote SslStream can emit ClientHello while we dial loopback.
-  const established =
-    "HTTP/1.1 200 Connection Established\r\n" +
-    "Proxy-Agent: EveJS Elysian\r\n" +
-    "\r\n";
   try {
-    clientSocket.setNoDelay(true);
-    clientSocket.setKeepAlive(true, SOCKET_KEEPALIVE_INITIAL_DELAY_MS);
+    clientSocket.pause();
+  } catch {
+    // ignore
+  }
+  try {
     clientSocket.setTimeout(0);
   } catch {
     // ignore
   }
 
-  log.proxy(
-    `CONNECT ${label} -> LOCAL-MITM-HTTPS 127.0.0.1:${connectMitmPort}`,
-  );
-
-  if (!clientSocket.write(established)) {
-    // rare: wait for drain before accepting more — still dial MITM
-  }
-
-  const upstream = net.connect({ host: "127.0.0.1", port: connectMitmPort });
-
-  const flushPending = () => {
-    while (pendingFromClient.length > 0 && !upstream.destroyed) {
-      const chunk = pendingFromClient.shift();
-      const ok = upstream.write(chunk);
-      if (!ok) {
-        try {
-          clientSocket.pause();
-        } catch {
-          // ignore
-        }
-        break;
+  let settled = false;
+  const failDial = (err) => {
+    if (settled) {
+      return;
+    }
+    settled = true;
+    log.proxyErr(
+      `CONNECT MITM dial error ${label}: ${err && err.message ? err.message : err}`,
+    );
+    if (!clientSocket.destroyed) {
+      try {
+        clientSocket.write("HTTP/1.1 502 Bad Gateway\r\n\r\n");
+      } catch {
+        // ignore
       }
+      clientSocket.destroy();
     }
   };
 
-  upstream.on("connect", () => {
-    upstreamReady = true;
-    try {
-      upstream.setNoDelay(true);
-      upstream.setKeepAlive(true, SOCKET_KEEPALIVE_INITIAL_DELAY_MS);
-      upstream.setTimeout(0);
-    } catch {
-      // ignore
-    }
-    flushPending();
-    try {
-      clientSocket.resume();
-    } catch {
-      // ignore
-    }
-  });
+  const upstream = net.connect({ host: "127.0.0.1", port: mitmPort }, () => {
+    const established =
+      "HTTP/1.1 200 Connection Established\r\n" +
+      "Proxy-Agent: EveJS Elysian\r\n" +
+      "\r\n";
 
-  clientSocket.on("data", (chunk) => {
-    upBytes += chunk.length;
-    if (!upstreamReady || upstream.destroyed) {
-      pendingFromClient.push(chunk);
-      return;
-    }
-    const ok = upstream.write(chunk);
-    if (!ok) {
-      try {
-        clientSocket.pause();
-      } catch {
-        // ignore
-      }
-    }
-  });
-
-  upstream.on("data", (chunk) => {
-    downBytes += chunk.length;
-    if (clientSocket.destroyed) {
-      return;
-    }
-    const ok = clientSocket.write(chunk);
-    if (!ok) {
-      try {
-        upstream.pause();
-      } catch {
-        // ignore
-      }
-    }
-  });
-
-  clientSocket.on("drain", () => {
-    if (!upstream.destroyed) {
-      upstream.resume();
-    }
-  });
-  upstream.on("drain", () => {
-    if (!clientSocket.destroyed) {
-      clientSocket.resume();
-    }
-  });
-
-  clientSocket.on("error", () => finish("client-error"));
-  upstream.on("error", (err) => {
-    if (!upstreamReady) {
-      log.proxyErr(`CONNECT MITM upstream error ${label}: ${err.message}`);
-      if (!clientSocket.destroyed) {
+    clientSocket.write(established, (writeErr) => {
+      if (writeErr) {
+        failDial(writeErr);
         try {
-          // 200 may already be sent; just tear down tunnel.
+          upstream.destroy();
         } catch {
           // ignore
         }
+        return;
       }
-    }
-    finish("upstream-error");
+      if (settled || clientSocket.destroyed) {
+        try {
+          upstream.destroy();
+        } catch {
+          // ignore
+        }
+        return;
+      }
+      settled = true;
+
+      log.proxy(`CONNECT ${label} -> LOCAL-MITM-HTTPS 127.0.0.1:${mitmPort}`);
+
+      wireTunnel(clientSocket, upstream, head, tunnelLabel, {
+        idleTimeoutMs: INTERCEPT_PROXY_TUNNEL_IDLE_TIMEOUT_MS,
+      });
+
+      try {
+        clientSocket.resume();
+      } catch {
+        // ignore
+      }
+    });
   });
-  clientSocket.on("close", () => finish("client-close"));
-  upstream.on("close", () => finish("upstream-close"));
-  clientSocket.on("end", () => {
-    if (upstream && !upstream.destroyed) {
-      upstream.end();
+
+  upstream.once("error", failDial);
+  clientSocket.once("error", () => {
+    if (!settled) {
+      settled = true;
     }
-  });
-  upstream.on("end", () => {
-    if (!clientSocket.destroyed) {
-      clientSocket.end();
+    try {
+      upstream.destroy();
+    } catch {
+      // ignore
     }
   });
 
