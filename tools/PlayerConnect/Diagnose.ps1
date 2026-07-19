@@ -29,6 +29,40 @@ function Write-Bad([string]$t) {
 }
 function Write-Info([string]$t) { Write-Host "  $t" -ForegroundColor Gray }
 
+# SChannel must get a *typed* RemoteCertificateValidationCallback. A bare
+# scriptblock is often ignored on Windows PowerShell 5.1, so the untrusted
+# EveJS CA is rejected mid-handshake (server sees ▲ClientHello ▼ServerCert
+# then client-close, and never logs CONNECT TLS-OK).
+function New-AcceptAllCertCallback {
+  return [System.Net.Security.RemoteCertificateValidationCallback] {
+    param(
+      [object]$sender,
+      [System.Security.Cryptography.X509Certificates.X509Certificate]$certificate,
+      [System.Security.Cryptography.X509Certificates.X509Chain]$chain,
+      [System.Net.Security.SslPolicyErrors]$sslPolicyErrors
+    )
+    try {
+      if ($null -ne $certificate) {
+        $script:remoteCert = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2 $certificate
+      }
+      $script:policy = $sslPolicyErrors
+    } catch {
+      # keep accepting
+    }
+    return $true
+  }
+}
+
+try {
+  # .NET Framework defaults can exclude TLS1.2 on older images.
+  [Net.ServicePointManager]::SecurityProtocol = `
+    [Net.SecurityProtocolType]::Tls12 -bor `
+    [Net.SecurityProtocolType]::Tls11 -bor `
+    [Net.SecurityProtocolType]::Tls
+} catch {
+  # ignore
+}
+
 if (-not (Test-Path -LiteralPath $ServerJson)) {
   throw "server.json not found next to Diagnose.ps1: $ServerJson"
 }
@@ -138,14 +172,10 @@ function Test-DirectTls([string]$TargetHost, [int]$Port, [string]$Sni, $TrustedC
     $client.EndConnect($iar)
     Write-Ok "TCP connected"
 
-    $callback = {
-      param($sender, $certificate, $chain, $sslPolicyErrors)
-      $script:remoteCert = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2 $certificate
-      $script:policy = $sslPolicyErrors
-      return $true
-    }
+    $callback = New-AcceptAllCertCallback
     $ssl = New-Object System.Net.Security.SslStream($client.GetStream(), $false, $callback)
-    $ssl.AuthenticateAsClient($Sni)
+    $tls12 = [System.Security.Authentication.SslProtocols]::Tls12
+    $ssl.AuthenticateAsClient($Sni, $null, $tls12, $false)
     Write-Ok ("TLS handshake completed ({0})" -f $ssl.SslProtocol)
     Write-Info ("leaf Subject={0}" -f $script:remoteCert.Subject)
     Write-Info ("leaf Issuer ={0}" -f $script:remoteCert.Issuer)
@@ -187,17 +217,28 @@ Test-DirectTls -TargetHost $hostName -Port $xmppPort -Sni "localhost" -TrustedCa
 function Read-ConnectResponse([System.Net.Sockets.NetworkStream]$Stream) {
   # Read raw bytes until CRLFCRLF — do NOT use StreamReader (it can buffer past
   # the HTTP headers and steal the start of the TLS handshake).
+  $prevTimeout = $Stream.ReadTimeout
+  try {
+    $Stream.ReadTimeout = 10000
+  } catch {}
   $ms = New-Object System.IO.MemoryStream
   $prev = [byte[]]@(0, 0, 0, 0)
-  while ($true) {
-    $b = $Stream.ReadByte()
-    if ($b -lt 0) { break }
-    $ms.WriteByte([byte]$b)
-    $prev[0] = $prev[1]; $prev[1] = $prev[2]; $prev[2] = $prev[3]; $prev[3] = [byte]$b
-    if ($prev[0] -eq 13 -and $prev[1] -eq 10 -and $prev[2] -eq 13 -and $prev[3] -eq 10) {
-      break
+  try {
+    while ($true) {
+      $b = $Stream.ReadByte()
+      if ($b -lt 0) { break }
+      $ms.WriteByte([byte]$b)
+      $prev[0] = $prev[1]; $prev[1] = $prev[2]; $prev[2] = $prev[3]; $prev[3] = [byte]$b
+      if ($prev[0] -eq 13 -and $prev[1] -eq 10 -and $prev[2] -eq 13 -and $prev[3] -eq 10) {
+        break
+      }
+      if ($ms.Length -gt 8192) { throw "CONNECT response too large / missing header end" }
     }
-    if ($ms.Length -gt 8192) { throw "CONNECT response too large / missing header end" }
+  } finally {
+    try { $Stream.ReadTimeout = $prevTimeout } catch {}
+  }
+  if ($ms.Length -eq 0) {
+    throw "empty CONNECT response (connection closed before proxy replied)"
   }
   return [Text.Encoding]::ASCII.GetString($ms.ToArray())
 }
@@ -219,7 +260,7 @@ function Test-GatewayTls {
     $client.NoDelay = $true
     $client.Connect($ProxyHost, $ProxyPort)
     $stream = $client.GetStream()
-    $req = "CONNECT dev-public-gateway.evetech.net:443 HTTP/1.1`r`nHost: dev-public-gateway.evetech.net:443`r`n`r`n"
+    $req = "CONNECT dev-public-gateway.evetech.net:443 HTTP/1.1`r`nHost: dev-public-gateway.evetech.net:443`r`nConnection: keep-alive`r`n`r`n"
     $bytes = [Text.Encoding]::ASCII.GetBytes($req)
     $stream.Write($bytes, 0, $bytes.Length)
     $stream.Flush()
@@ -228,20 +269,18 @@ function Test-GatewayTls {
     Write-Info "proxy reply: $statusLine"
     if ($statusLine -notmatch "200") {
       Write-Bad "proxy CONNECT failed"
+      Write-Info ("raw: {0}" -f ($resp.Substring(0, [Math]::Min(200, $resp.Length)) -replace "`r|`n", " | "))
       return $false
     }
     Write-Ok "proxy CONNECT established (tunnel)"
-    $callback = {
-      param($sender, $certificate, $chain, $sslPolicyErrors)
-      $script:remoteCert = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2 $certificate
-      $script:policy = $sslPolicyErrors
-      return $true
-    }
+    # Typed callback — required so untrusted EveJS leaf is accepted under SChannel.
+    $callback = New-AcceptAllCertCallback
     $ssl = New-Object System.Net.Security.SslStream($stream, $false, $callback)
     if ($null -ne $SslProtocol) {
       $ssl.AuthenticateAsClient("dev-public-gateway.evetech.net", $null, $SslProtocol, $false)
     } else {
-      $ssl.AuthenticateAsClient("dev-public-gateway.evetech.net")
+      $tls12 = [System.Security.Authentication.SslProtocols]::Tls12
+      $ssl.AuthenticateAsClient("dev-public-gateway.evetech.net", $null, $tls12, $false)
     }
     Write-Ok ("Gateway TLS completed ({0})" -f $ssl.SslProtocol)
     Write-Info ("leaf Subject={0}" -f $script:remoteCert.Subject)
@@ -254,9 +293,16 @@ function Test-GatewayTls {
     }
     return $true
   } catch {
-    Write-Bad "gateway TLS failed ($ProtocolLabel): $($_.Exception.Message)"
+    $ex = $_.Exception
+    Write-Bad "gateway TLS failed ($ProtocolLabel): $($ex.Message)"
+    if ($ex.InnerException) {
+      Write-Info ("inner: {0}" -f $ex.InnerException.Message)
+    }
     if ($script:remoteCert) {
       Write-Info ("leaf Subject={0} Issuer={1}" -f $script:remoteCert.Subject, $script:remoteCert.Issuer)
+      Write-Info ("SslPolicyErrors at fail={0}" -f $script:policy)
+    } else {
+      Write-Info "no leaf cert received (handshake aborted before Certificate, or callback not invoked)"
     }
     return $false
   } finally {
@@ -270,7 +316,8 @@ $tls12 = [System.Security.Authentication.SslProtocols]::Tls12
 # Prefer TLS1.2 first — more reliable through FRP/SChannel than negotiated TLS1.3.
 $okGw = Test-GatewayTls -ProxyHost $hostName -ProxyPort $proxyPort -ProtocolLabel "TLS1.2 only" -SslProtocol $tls12
 if (-not $okGw) {
-  $okGw = Test-GatewayTls -ProxyHost $hostName -ProxyPort $proxyPort -ProtocolLabel "default SslProtocols" -SslProtocol $null
+  Start-Sleep -Milliseconds 300
+  $okGw = Test-GatewayTls -ProxyHost $hostName -ProxyPort $proxyPort -ProtocolLabel "TLS1.2 retry" -SslProtocol $tls12
 }
 if (-not $okGw) {
   Write-Info "CONNECT 200 + TLS reset often means:"

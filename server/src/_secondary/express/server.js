@@ -885,12 +885,14 @@ function ensureConnectMitmHttpsServer() {
     return connectMitmHttpsServer;
   }
   const { tlsOptions } = loadLocalTlsOptions();
-  // Prefer TLS1.2 for SChannel/Diagnose and FRP paths; TLS1.3 is still allowed.
+  // TLS1.2-only: SChannel/Diagnose through FRP is more reliable than TLS1.3 here.
+  // (Node loopback self-test can do TLS1.3; remote SslStream often aborts mid-flight.)
   connectMitmHttpsServer = https.createServer(
     {
       key: tlsOptions.key,
       cert: tlsOptions.cert,
       minVersion: "TLSv1.2",
+      maxVersion: "TLSv1.2",
       // Diagnose.ps1 / SslStream: HTTP/1.1 only (no h2 preface).
       ALPNProtocols: ["http/1.1"],
     },

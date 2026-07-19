@@ -131,6 +131,7 @@ function buildLocalLeafCertificate(options) {
     },
   ]);
   cert.setIssuer(caCert.subject.attributes);
+  // Keep extensions SChannel-friendly (non-critical EKU; standard serverAuth).
   cert.setExtensions([
     {
       name: "basicConstraints",
@@ -146,7 +147,7 @@ function buildLocalLeafCertificate(options) {
     {
       name: "extKeyUsage",
       serverAuth: true,
-      critical: true,
+      critical: false,
     },
     {
       name: "subjectAltName",
@@ -154,6 +155,10 @@ function buildLocalLeafCertificate(options) {
     },
     {
       name: "subjectKeyIdentifier",
+    },
+    {
+      name: "authorityKeyIdentifier",
+      keyIdentifier: true,
     },
   ]);
 
@@ -243,6 +248,27 @@ function hasRequiredAltNames(certPem) {
   );
 }
 
+function leafHasSchannelFriendlyExtensions(certPem) {
+  try {
+    const firstPem =
+      String(certPem || "").match(
+        /-----BEGIN CERTIFICATE-----[\s\S]*?-----END CERTIFICATE-----/,
+      )?.[0] || certPem;
+    const cert = forge.pki.certificateFromPem(firstPem);
+    const eku = cert.getExtension("extKeyUsage");
+    // Older leaves marked EKU critical — SChannel can abort mid-handshake.
+    if (eku && eku.critical) {
+      return false;
+    }
+    if (!cert.getExtension("authorityKeyIdentifier")) {
+      return false;
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 function ensureLocalLeafCertificate(options = {}) {
   const certDir = options.certDir || path.join(__dirname, "certs");
   const outCertPath =
@@ -262,7 +288,8 @@ function ensureLocalLeafCertificate(options = {}) {
     existingCertPem &&
     fs.existsSync(outKeyPath) &&
     hasRequiredAltNames(existingCertPem) &&
-    isIssuedByCertificateAuthority(existingCertPem, caCertPath)
+    isIssuedByCertificateAuthority(existingCertPem, caCertPath) &&
+    leafHasSchannelFriendlyExtensions(existingCertPem)
   ) {
     return {
       outCertPath,
