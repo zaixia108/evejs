@@ -21,14 +21,40 @@ const LOCAL_TLS_DNS_ALT_NAMES = Object.freeze([
   "localhost",
 ]);
 const LOCAL_TLS_IP_ALT_NAMES = Object.freeze(["127.0.0.1"]);
+/** Bump to force rebuild of gateway-dev-cert.pem on all hosts. */
+const GATEWAY_LEAF_CERT_GENERATION = "7-tls12-schannel";
 
 function ensureParentDirectory(filePath) {
   fs.mkdirSync(path.dirname(filePath), { recursive: true });
 }
 
 function randomSerialNumber() {
-  const hex = forge.util.bytesToHex(forge.random.getBytesSync(16));
-  return hex.replace(/^0+/, "") || "01";
+  // SChannel rejects serials that decode as negative (high bit set).
+  const bytes = Buffer.from(forge.random.getBytesSync(16), "binary");
+  bytes[0] &= 0x7f;
+  if (bytes[0] === 0) {
+    bytes[0] = 0x01;
+  }
+  return bytes.toString("hex");
+}
+
+function normalizeCertificatePem(pem) {
+  const cert = forge.pki.certificateFromPem(pem);
+  const asn1 = forge.pki.certificateToAsn1(cert);
+  const der = forge.asn1.toDer(asn1).getBytes();
+  const reparsed = forge.pki.certificateFromAsn1(forge.asn1.fromDer(der));
+  return forge.pki.certificateToPem(reparsed).trim();
+}
+
+function assertNodeParsesCertificate(pem) {
+  try {
+    // eslint-disable-next-line no-new
+    new crypto.X509Certificate(pem);
+  } catch (err) {
+    throw new Error(
+      `generated gateway cert is not parseable by Node/OpenSSL: ${err.message}`,
+    );
+  }
 }
 
 function makeValidity(years) {
@@ -131,6 +157,8 @@ function buildLocalLeafCertificate(options) {
     },
   ]);
   cert.setIssuer(caCert.subject.attributes);
+  // Minimal extensions — avoid forge AKI quirks that SChannel may reject
+  // before the RemoteCertificateValidationCallback runs.
   cert.setExtensions([
     {
       name: "basicConstraints",
@@ -146,7 +174,7 @@ function buildLocalLeafCertificate(options) {
     {
       name: "extKeyUsage",
       serverAuth: true,
-      critical: true,
+      critical: false,
     },
     {
       name: "subjectAltName",
@@ -159,18 +187,27 @@ function buildLocalLeafCertificate(options) {
 
   cert.sign(caKey, forge.md.sha256.create());
 
+  const leafPem = normalizeCertificatePem(forge.pki.certificateToPem(cert));
+  assertNodeParsesCertificate(leafPem);
+
   ensureParentDirectory(options.outCertPath);
   ensureParentDirectory(options.outKeyPath);
-  fs.writeFileSync(
-    options.outCertPath,
-    `${forge.pki.certificateToPem(cert).trim()}\n${caPem}\n`,
-    "utf8",
-  );
+  fs.writeFileSync(options.outCertPath, `${leafPem}\n${caPem}\n`, "utf8");
   fs.writeFileSync(
     options.outKeyPath,
     forge.pki.privateKeyToPem(keyPair.privateKey),
     "utf8",
   );
+  // Generation stamp so ensureLocalLeafCertificate can force rebuilds.
+  try {
+    fs.writeFileSync(
+      `${options.outCertPath}.gen`,
+      `${GATEWAY_LEAF_CERT_GENERATION}\n`,
+      "utf8",
+    );
+  } catch {
+    // ignore
+  }
 }
 
 function certificateAttributesEqual(left = [], right = []) {
@@ -243,6 +280,19 @@ function hasRequiredAltNames(certPem) {
   );
 }
 
+function gatewayLeafGenerationMatches(outCertPath) {
+  try {
+    const stampPath = `${outCertPath}.gen`;
+    if (!fs.existsSync(stampPath)) {
+      return false;
+    }
+    const stamp = fs.readFileSync(stampPath, "utf8").trim();
+    return stamp === GATEWAY_LEAF_CERT_GENERATION;
+  } catch {
+    return false;
+  }
+}
+
 function ensureLocalLeafCertificate(options = {}) {
   const certDir = options.certDir || path.join(__dirname, "certs");
   const outCertPath =
@@ -262,7 +312,8 @@ function ensureLocalLeafCertificate(options = {}) {
     existingCertPem &&
     fs.existsSync(outKeyPath) &&
     hasRequiredAltNames(existingCertPem) &&
-    isIssuedByCertificateAuthority(existingCertPem, caCertPath)
+    isIssuedByCertificateAuthority(existingCertPem, caCertPath) &&
+    gatewayLeafGenerationMatches(outCertPath)
   ) {
     return {
       outCertPath,
