@@ -406,11 +406,13 @@ def start_evejs_server(log: LogFn | None = None) -> ProcessHandle:
         # Matching Server.bat: cd server && npm start with env vars set.
         data_dir = env["EVEJS_GAMESTORE_DATA_DIR"]
         # Use cmd /k so the window stays after errors; title for taskbar.
+        # Quote every path: spaces / non-ASCII (e.g. "副本") break unquoted set/cd
+        # and produce: 文件名、目录名或卷标语法不正确。
         inner = (
             f'title EveJS Server & '
             f'cd /d "{server_dir}" & '
-            f"set EVEJS_PROXY_LOCAL_INTERCEPT=1 & "
-            f'set EVEJS_GAMESTORE_DATA_DIR={data_dir} & '
+            f'set "EVEJS_PROXY_LOCAL_INTERCEPT=1" & '
+            f'set "EVEJS_GAMESTORE_DATA_DIR={data_dir}" & '
             f"npm start"
         )
         proc = subprocess.Popen(

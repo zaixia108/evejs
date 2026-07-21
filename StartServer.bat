@@ -62,7 +62,11 @@ if not exist "%EVEJS_REPO_ROOT%\server\logs\node-reports" mkdir "%EVEJS_REPO_ROO
 
 if "%PLAY_CHOICE%"=="2" (
   echo   Starting server in background...
-  start "EvEJS Server" cmd /c "cd /d "%EVEJS_REPO_ROOT%\server" && set EVEJS_PROXY_LOCAL_INTERCEPT=1 && npm start"
+  rem Use start /D for the server cwd — avoids nested "cd /d "quotes"" which
+  rem break when EVEJS_REPO_ROOT contains spaces (e.g. "EveJS - 副本").
+  rem Pass EVEJS_GAMESTORE_DATA_DIR so the child does not fall back to the
+  rem empty server\src\gameStore\data stub.
+  start "EvEJS Server" /D "%EVEJS_REPO_ROOT%\server" cmd /k set "EVEJS_PROXY_LOCAL_INTERCEPT=1"^& set "EVEJS_GAMESTORE_DATA_DIR=%EVEJS_GAMESTORE_DATA_DIR%"^& npm start
   echo   Server starting up...
   echo.
 
