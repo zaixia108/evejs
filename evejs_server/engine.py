@@ -386,6 +386,18 @@ def _windows_new_console_flags() -> int:
 
 
 def start_evejs_server(log: LogFn | None = None) -> ProcessHandle:
+    """Start npm server the same way Server.bat does (env + cwd), own console on Windows.
+
+    Server.bat pattern:
+      set EVEJS_GAMESTORE_DATA_DIR=...\\_local\\gameStore\\data
+      pushd server
+      npm start
+
+    Older launcher code re-set paths inside `cmd /k "set ...=path & npm start"`.
+    Paths with spaces or non-ASCII then produced:
+      文件名、目录名或卷标语法不正确
+    and Node fell back to empty static tables (0 stations).
+    """
     root = repo_root()
     server_dir = root / "server"
     if not (server_dir / "index.js").is_file():
@@ -394,33 +406,54 @@ def start_evejs_server(log: LogFn | None = None) -> ProcessHandle:
     if not npm:
         raise RuntimeError("npm not found on PATH")
 
+    data_dir = (root / "_local" / "gameStore" / "data").resolve()
+    stations_file = data_dir / "stations" / "data.json"
+    if not stations_file.is_file() or stations_file.stat().st_size < 1024:
+        raise FileNotFoundError(
+            "静态站表缺失或为空，Launcher 与 Server.bat 都会因此出站失败。\n"
+            f"  期望: {stations_file}\n"
+            f"  项目根(repo_root): {root}\n"
+            "  请在该根目录运行 tools\\DatabaseCreator\\CreateDatabase.bat /force\n"
+            "  或先用 Server.bat 完整建库后再用 Launcher。"
+        )
+
     env = os.environ.copy()
+    # Ensure child sees a complete PATH (some GUI-launched processes drop it).
+    if sys.platform == "win32":
+        system_root = os.environ.get("SystemRoot", r"C:\Windows")
+        path_parts = [
+            env.get("Path") or env.get("PATH") or "",
+            str(Path(system_root) / "System32"),
+            str(Path(system_root)),
+        ]
+        env["Path"] = os.pathsep.join(p for p in path_parts if p)
+        env["PATH"] = env["Path"]
+
     env["EVEJS_PROXY_LOCAL_INTERCEPT"] = "1"
-    env["EVEJS_GAMESTORE_DATA_DIR"] = str(root / "_local" / "gameStore" / "data")
+    # Pass data dir only via process environment (like Server.bat) — do NOT
+    # re-encode the path through cmd.exe `set` (breaks on spaces / 中文).
+    env["EVEJS_GAMESTORE_DATA_DIR"] = str(data_dir)
+
     (root / "server" / "logs" / "node-reports").mkdir(parents=True, exist_ok=True)
 
+    _log(log, "info", f"repo_root = {root}")
+    _log(log, "info", f"EVEJS_GAMESTORE_DATA_DIR = {data_dir}")
+    _log(
+        log,
+        "info",
+        f"stations table = {stations_file.stat().st_size} bytes",
+    )
     _log(log, "info", "Starting EveJS server in a new console window...")
 
     if sys.platform == "win32":
-        # New CMD window, keep open on exit (/k) so user can read crash logs.
-        # Matching Server.bat: cd server && npm start with env vars set.
-        data_dir = env["EVEJS_GAMESTORE_DATA_DIR"]
-        # Use cmd /k so the window stays after errors; title for taskbar.
-        # Quote every path: spaces / non-ASCII (e.g. "副本") break unquoted set/cd
-        # and produce: 文件名、目录名或卷标语法不正确。
-        inner = (
-            f'title EveJS Server & '
-            f'cd /d "{server_dir}" & '
-            f'set "EVEJS_PROXY_LOCAL_INTERCEPT=1" & '
-            f'set "EVEJS_GAMESTORE_DATA_DIR={data_dir}" & '
-            f"npm start"
-        )
+        # Own console for logs (piping freezes on large preload).
+        # cwd=server_dir replaces fragile `cd /d "..."`.
+        # Env is inherited from Popen(env=) — same as Server.bat after set.
         proc = subprocess.Popen(
-            ["cmd.exe", "/k", inner],
+            ["cmd.exe", "/k", "title EveJS Server && npm start"],
             cwd=str(server_dir),
             env=env,
             creationflags=_windows_new_console_flags(),
-            close_fds=True,
         )
     else:
         proc = subprocess.Popen(
@@ -432,9 +465,16 @@ def start_evejs_server(log: LogFn | None = None) -> ProcessHandle:
 
     time.sleep(0.8)
     if proc.poll() is not None:
-        raise RuntimeError(f"Server window exited immediately with code {proc.returncode}")
+        raise RuntimeError(
+            f"Server window exited immediately with code {proc.returncode}"
+        )
     _log(log, "ok", f"EveJS server console started (pid={proc.pid})")
-    _log(log, "info", "Watch the separate black CMD window for preload / ready logs.")
+    _log(
+        log,
+        "info",
+        "Watch the separate black CMD window: expect "
+        "'[SpaceWorld] Loaded ... stations' with stations >> 0.",
+    )
     return ProcessHandle("evejs", proc)
 
 
